@@ -210,7 +210,7 @@ collect_state() {
 pull_images() {
   local output
   if ! output=$(docker compose pull --quiet 2>&1); then
-    log error pull_failed "docker compose pull failed (registry login?)" output "$output"
+    log error pull_failed "docker compose pull failed (network or registry problem?)" output "$output"
     exit 1
   fi
 }

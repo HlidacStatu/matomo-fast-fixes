@@ -19,8 +19,8 @@ Why no data is lost:
 
 Downtime is minimal because:
 
-- everything that can be prepared in advance (files, registry login, image
-  pulls, backup) is done while the old stack keeps serving,
+- everything that can be prepared in advance (files, image pulls, backup)
+  is done while the old stack keeps serving,
 - the switch itself is a single `docker compose up -d --wait`, which recreates
   the containers in place.
 
@@ -65,7 +65,6 @@ Check these before you continue:
   downtime window.
 - **Existing `.env` in `/opt/matomo`.** If there is one, merge its content into
   the new `.env` in step 2. Step 5 replaces it.
-
 - **Matomo version.** The new image ships the latest `5.x` release. If you run
   4.x, first read Matomo's
   [4 to 5 upgrade notes](https://matomo.org/faq/how-to-update/how-to-upgrade-to-matomo-5/)
@@ -82,17 +81,13 @@ Check these before you continue:
 - **Free disk space.** You need at least the size of the Matomo database,
   roughly `du -sh /data/matomo/db`, for the compressed dump.
 
-## 1. Registry access and repository (no downtime)
+## 1. Repository (no downtime)
 
-The image is in a private GHCR package. The GHCR container registry accepts
-only **classic** personal access tokens. Create one with only the
-`read:packages` scope and an expiry:
-<https://github.com/settings/tokens/new?scopes=read:packages&description=matomo-ghcr-pull>.
-Paste it directly on the server, not into chat or a ticket, and log in as the
-user that runs docker (root):
+Both the repository and the GHCR package `ghcr.io/hlidacstatu/matomo` are
+public, so neither the clone nor the image pulls need a token or
+`docker login`.
 
 ```sh
-read -rs TOKEN && echo "$TOKEN" | docker login ghcr.io -u <github-user> --password-stdin && unset TOKEN
 git clone https://github.com/HlidacStatu/matomo-fast-fixes /opt/matomo-fast-fixes
 ```
 
@@ -130,7 +125,8 @@ docker compose config >/dev/null && echo "config OK"
 docker compose pull
 ```
 
-If `pull` fails with `denied` or `unauthorized`, repeat step 1.
+If `pull` fails with `denied` or `unauthorized`, check that `MATOMO_IMAGE` in
+`.env` is spelled exactly `ghcr.io/hlidacstatu/matomo:5` (lowercase).
 
 Never run `docker compose up` in `.new`: it uses the same project name as the
 running stack and would replace its containers before the backup is taken.

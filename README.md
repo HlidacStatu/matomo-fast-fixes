@@ -58,22 +58,16 @@ the workflow files because GitHub cannot read them from elsewhere.
 Requirements: Docker Engine 25+ with the compose plugin (healthcheck
 `start_interval`), `jq`, `flock` (util-linux), `curl`, `gzip`.
 
-1. **Registry access.** The package is private. GHCR accepts only classic
-   personal access tokens: create one with just `read:packages`
-   (<https://github.com/settings/tokens/new?scopes=read:packages&description=matomo-ghcr-pull>)
-   and log in as root on the server:
+The repository and the image are public: no token or `docker login` is
+needed on the servers.
 
-   ```sh
-   read -rs TOKEN && echo "$TOKEN" | docker login ghcr.io -u <github-user> --password-stdin && unset TOKEN
-   ```
-
-2. **Scripts.**
+1. **Scripts.**
 
    ```sh
    git clone https://github.com/HlidacStatu/matomo-fast-fixes /opt/matomo-fast-fixes
    ```
 
-3. **Stack.** Put `server/compose.yml` into the stack directory (e.g.
+2. **Stack.** Put `server/compose.yml` into the stack directory (e.g.
    `/opt/matomo`) and create the configuration from the examples:
 
    ```sh
@@ -98,7 +92,7 @@ Requirements: Docker Engine 25+ with the compose plugin (healthcheck
      password manually (`ALTER USER 'root'@'%' IDENTIFIED BY ...`),
    - `redis:4.0` is replaced by `redis:8-alpine`; Redis holds only cache data.
 
-4. **Update script.**
+3. **Update script.**
 
    ```sh
    install -d -m 700 /etc/matomo-update
@@ -144,9 +138,9 @@ restore the matching backup from `BACKUP_DIR` if the DB was migrated, then
 - **New Alpine branch**: change `ALPINE_VERSION` (and PHP package names if
   needed) in a pull request; CI builds and tests it.
 - **GitHub Actions** are pinned by SHA; Dependabot proposes updates.
-- **Actions minutes / storage**: the repository is private. One platform
-  (`linux/amd64`) keeps the daily rebuild short; `KEEP_PACKAGE_VERSIONS`
-  limits GHCR storage.
+- **Build time**: one platform (`linux/amd64`) keeps the daily rebuild short;
+  each extra platform in `PLATFORMS` is built under QEMU. `KEEP_PACKAGE_VERSIONS`
+  limits the number of image versions kept in GHCR.
 
 ## Tests
 
