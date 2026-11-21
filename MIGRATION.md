@@ -42,9 +42,29 @@ docker compose exec matomo console core:version     # current Matomo version
 docker compose exec db mariadb --version            # current MariaDB version
 docker compose exec redis redis-server --version
 df -h /data/matomo                                  # free space for a DB dump
+docker version --format '{{.Server.Version}}'       # must be 25 or newer
+command -v jq flock curl gzip                       # needed by matomo-update.sh
+ls -la /opt/matomo/.env 2>/dev/null                 # an existing .env would be replaced in step 5
+grep -A12 '^\[database\]' /data/matomo/web/config/config.ini.php
 ```
 
 Check these before you continue:
+
+- **Database credentials Matomo really uses (stop if they differ).** In the
+  `[database]` section, `host` must be `db`, `username` must be the old
+  `MYSQL_USER`, and `dbname` must be the old `MYSQL_DATABASE`.
+  - The backups (step 3 and `matomo-update.sh`) dump `MYSQL_DATABASE` as
+    `MYSQL_USER`. If Matomo was installed against `root` or another database,
+    those backups would be empty.
+  - The root password change in step 8 would also cut Matomo off.
+  - Fix this first: create a dedicated user with access to Matomo's database
+    and switch `config.ini.php` to it. Alternatively, set `MYSQL_*` in `.env`
+    to match.
+- **Docker Engine 25 or newer.** `compose.yml` uses the healthcheck setting
+  `start_interval`. An older engine fails only at `up`, in the middle of the
+  downtime window.
+- **Existing `.env` in `/opt/matomo`.** If there is one, merge its content into
+  the new `.env` in step 2. Step 5 replaces it.
 
 - **Matomo version.** The new image ships the latest `5.x` release. If you run
   4.x, first read Matomo's
@@ -64,11 +84,15 @@ Check these before you continue:
 
 ## 1. Registry access and repository (no downtime)
 
-The image is in a private GHCR package. Create a GitHub token with
-`read:packages` and log in as the user that runs docker (root):
+The image is in a private GHCR package. The GHCR container registry accepts
+only **classic** personal access tokens. Create one with only the
+`read:packages` scope and an expiry:
+<https://github.com/settings/tokens/new?scopes=read:packages&description=matomo-ghcr-pull>.
+Paste it directly on the server, not into chat or a ticket, and log in as the
+user that runs docker (root):
 
 ```sh
-echo "$TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
+read -rs TOKEN && echo "$TOKEN" | docker login ghcr.io -u <github-user> --password-stdin && unset TOKEN
 git clone https://github.com/HlidacStatu/matomo-fast-fixes /opt/matomo-fast-fixes
 ```
 
@@ -126,14 +150,17 @@ docker compose exec -T db sh -c \
      --add-drop-database -u"$MYSQL_USER" --databases "$MYSQL_DATABASE"' \
   | gzip > /data/matomo/backups/matomo-db-$TS-pre-migration.sql.gz
 
-# The dump must end with "-- Dump completed":
+# The dump must end with "-- Dump completed" and contain Matomo's tables
+# (an empty database would also "complete"):
 gzip -dc /data/matomo/backups/matomo-db-$TS-pre-migration.sql.gz | tail -n1
+gzip -dc /data/matomo/backups/matomo-db-$TS-pre-migration.sql.gz | grep -c '^CREATE TABLE'
 
 tar -C /data/matomo/web -czf /data/matomo/backups/matomo-config-$TS-pre-migration.tar.gz config
 cp docker-compose.yml /data/matomo/backups/docker-compose-crazymax-$TS.yml
 ```
 
-Do not continue unless the last line of the dump reads `-- Dump completed`.
+Do not continue unless the last line of the dump reads `-- Dump completed`
+and the table count is in the dozens (a Matomo install has 30+ tables).
 
 The dump plus the unchanged bind mounts are enough to get back to the old
 state.

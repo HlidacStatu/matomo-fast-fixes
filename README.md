@@ -58,12 +58,13 @@ the workflow files because GitHub cannot read them from elsewhere.
 Requirements: Docker Engine 25+ with the compose plugin (healthcheck
 `start_interval`), `jq`, `flock` (util-linux), `curl`, `gzip`.
 
-1. **Registry access.** The package is private. Create a token with
-   `read:packages` (classic PAT or fine-grained with package read) and log in
-   as root on the server:
+1. **Registry access.** The package is private. GHCR accepts only classic
+   personal access tokens: create one with just `read:packages`
+   (<https://github.com/settings/tokens/new?scopes=read:packages&description=matomo-ghcr-pull>)
+   and log in as root on the server:
 
    ```sh
-   echo "$TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
+   read -rs TOKEN && echo "$TOKEN" | docker login ghcr.io -u <github-user> --password-stdin && unset TOKEN
    ```
 
 2. **Scripts.**
