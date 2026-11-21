@@ -1,4 +1,6 @@
 # syntax=docker/dockerfile:1
+# ALPINE_VERSION intentionally has no default (it comes from build.config):
+# check=skip=InvalidDefaultArgInFrom
 
 # Based on https://github.com/crazy-max/docker-matomo (MIT License).
 # Differences from upstream:
