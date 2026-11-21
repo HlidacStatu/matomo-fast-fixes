@@ -1,0 +1,226 @@
+# Reusable workflow: builds the image, tests it and (optionally) publishes it.
+#
+#   publish: never      - build + test only (pull requests)
+#            if-changed - publish only when the content fingerprint differs from
+#                         the published image of the same Matomo version
+#                         (daily security rebuild, pushes to main)
+#            always     - publish unconditionally (new Matomo release, manual)
+#
+# The candidate is built once for TEST_PLATFORM and tested. The publish build
+# reuses its layers from the GitHub Actions cache, so the published image for
+# TEST_PLATFORM has exactly the tested content (plus the fingerprint label).
+name: build-publish
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref (commit SHA) to build
+        type: string
+        required: true
+      no_cache:
+        description: Build without layer cache (fresh base image and packages)
+        type: boolean
+        required: true
+      publish:
+        description: never | if-changed | always
+        type: string
+        required: true
+    outputs:
+      published:
+        description: Whether a new image was published
+        value: ${{ jobs.build.outputs.published }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      # All publishing runs are serialised so tags cannot race each other.
+      group: ${{ inputs.publish == 'never' && format('build-{0}', github.run_id) || 'image-publish' }}
+      cancel-in-progress: false
+    outputs:
+      published: ${{ steps.decide.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Load build config
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          case "$PUBLISH" in
+            never|if-changed|always) ;;
+            *) echo "::error::invalid publish input: $PUBLISH"; exit 1 ;;
+          esac
+          scripts/build-config.sh >>"$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build candidate
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ env.TEST_PLATFORM }}
+          load: true
+          pull: true
+          no-cache: ${{ inputs.no_cache }}
+          provenance: false
+          tags: matomo:candidate
+          build-args: |
+            ALPINE_VERSION=${{ env.ALPINE_VERSION }}
+            MATOMO_VERSION=${{ env.MATOMO_VERSION }}
+            MATOMO_DOWNLOAD_BASE_URL=${{ env.MATOMO_DOWNLOAD_BASE_URL }}
+            MATOMO_GPG_FINGERPRINT=${{ env.MATOMO_GPG_FINGERPRINT }}
+            UNIFONT_URL=${{ env.UNIFONT_URL }}
+            GEOIP_MMDB_BASE_URL=${{ env.GEOIP_MMDB_BASE_URL }}
+          labels: |
+            org.opencontainers.image.title=Matomo
+            org.opencontainers.image.version=${{ env.MATOMO_VERSION }}
+            org.opencontainers.image.revision=${{ inputs.ref }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: test/smoke/run.sh matomo:candidate "$MATOMO_VERSION" "$SMOKE_TEST_TIMEOUT_SECONDS"
+
+      - name: Smoke test logs
+        if: failure()
+        run: cat test/smoke/compose.log || true
+
+      - name: Vulnerability report
+        # Informational only: unfixed upstream CVEs (e.g. in Matomo's vendored
+        # PHP libraries) must not block security rebuilds of everything else.
+        run: |
+          {
+            echo "## Trivy: fixable $TRIVY_SEVERITY vulnerabilities in the candidate"
+            echo '```'
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" \
+              image --quiet --no-progress --ignore-unfixed --severity "$TRIVY_SEVERITY" \
+              --format table matomo:candidate || echo "trivy scan failed"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Fingerprint candidate
+        id: fingerprint
+        run: echo "value=$(scripts/image-fingerprint.sh matomo:candidate)" >>"$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: inputs.publish != 'never'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to publish
+        id: decide
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          CANDIDATE_FINGERPRINT: ${{ steps.fingerprint.outputs.value }}
+        run: |
+          publish=false
+          reason="publishing disabled"
+          if [ "$PUBLISH" = always ]; then
+            publish=true
+            reason="forced"
+          elif [ "$PUBLISH" = if-changed ]; then
+            published_ref="$IMAGE_NAME:$MATOMO_VERSION"
+            if docker pull -q --platform "$TEST_PLATFORM" "$published_ref" >/dev/null 2>&1; then
+              published_fp=$(docker image inspect --format "{{ index .Config.Labels \"$FINGERPRINT_LABEL\" }}" "$published_ref")
+              if [ "$published_fp" = "$CANDIDATE_FINGERPRINT" ]; then
+                reason="content unchanged ($CANDIDATE_FINGERPRINT)"
+              else
+                publish=true
+                reason="content changed: $published_fp -> $CANDIDATE_FINGERPRINT"
+              fi
+            else
+              publish=true
+              reason="$published_ref is not published yet"
+            fi
+          fi
+          echo "publish=$publish" >>"$GITHUB_OUTPUT"
+          echo "Publish: $publish ($reason)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Compute tags
+        id: tags
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: echo "list=$(scripts/image-tags.sh "$IMAGE_NAME" "$MATOMO_VERSION" "$(date -u +%Y%m%d).$RUN_ID.$RUN_ATTEMPT")" >>"$GITHUB_OUTPUT"
+
+      - name: Publish
+        if: steps.decide.outputs.publish == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          pull: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            ALPINE_VERSION=${{ env.ALPINE_VERSION }}
+            MATOMO_VERSION=${{ env.MATOMO_VERSION }}
+            MATOMO_DOWNLOAD_BASE_URL=${{ env.MATOMO_DOWNLOAD_BASE_URL }}
+            MATOMO_GPG_FINGERPRINT=${{ env.MATOMO_GPG_FINGERPRINT }}
+            UNIFONT_URL=${{ env.UNIFONT_URL }}
+            GEOIP_MMDB_BASE_URL=${{ env.GEOIP_MMDB_BASE_URL }}
+          labels: |
+            org.opencontainers.image.title=Matomo
+            org.opencontainers.image.version=${{ env.MATOMO_VERSION }}
+            org.opencontainers.image.revision=${{ inputs.ref }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+            ${{ env.FINGERPRINT_LABEL }}=${{ steps.fingerprint.outputs.value }}
+          cache-from: type=gha
+
+      - name: Verify published content
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          CANDIDATE_FINGERPRINT: ${{ steps.fingerprint.outputs.value }}
+        run: |
+          ref="$IMAGE_NAME:$MATOMO_VERSION"
+          docker pull -q --platform "$TEST_PLATFORM" "$ref" >/dev/null
+          actual=$(scripts/image-fingerprint.sh "$ref")
+          if [ "$actual" != "$CANDIDATE_FINGERPRINT" ]; then
+            echo "::error::published image differs from the tested candidate ($actual != $CANDIDATE_FINGERPRINT)"
+            exit 1
+          fi
+          echo "Published $ref (fingerprint $actual)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    needs: build
+    if: needs.build.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Load build config
+        run: scripts/build-config.sh >>"$GITHUB_ENV"
+
+      - name: Delete old package versions
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
+        with:
+          package-name: ${{ env.PACKAGE_NAME }}
+          package-type: container
+          min-versions-to-keep: ${{ env.KEEP_PACKAGE_VERSIONS }}

@@ -1,0 +1,113 @@
+# Picks up new Matomo releases of the tracked major line (MATOMO_MAJOR).
+#
+# Flow: detect release -> bump build.config on a branch -> build, test and
+# publish from that branch -> fast-forward main. main therefore never points
+# to a version whose image failed to build; a failed run is retried by the
+# next scheduled run.
+#
+# Commits pushed with GITHUB_TOKEN do not trigger other workflows, which is
+# why the build is called directly as a reusable workflow.
+name: release-check
+
+on:
+  schedule:
+    # Every 3 hours (GitHub cron cannot be read from build.config).
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      update_available: ${{ steps.check.outputs.update_available }}
+      latest: ${{ steps.check.outputs.latest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check Matomo releases
+        id: check
+        run: scripts/check-release.sh | tee -a "$GITHUB_OUTPUT"
+
+      - name: Report
+        env:
+          CURRENT: ${{ steps.check.outputs.current }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          UPDATE: ${{ steps.check.outputs.update_available }}
+          NEWER_MAJOR: ${{ steps.check.outputs.newer_major }}
+        run: |
+          echo "Current: $CURRENT, latest in major line: $LATEST, update: $UPDATE" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -n "$NEWER_MAJOR" ]; then
+            echo "::warning::Matomo $NEWER_MAJOR (new major) is available; it is not built automatically. Raise MATOMO_MAJOR in build.config to switch."
+          fi
+
+  bump:
+    needs: check
+    if: needs.check.outputs.update_available == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      branch: ${{ steps.commit.outputs.branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Bump version on a branch
+        id: commit
+        env:
+          LATEST: ${{ needs.check.outputs.latest }}
+        run: |
+          branch="auto/matomo-$LATEST"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          scripts/bump-version.sh "$LATEST"
+          git commit -am "Bump Matomo to $LATEST"
+          git push --force origin "HEAD:refs/heads/$branch"
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+          echo "branch=$branch" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: bump
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-publish.yml
+    with:
+      ref: ${{ needs.bump.outputs.sha }}
+      no_cache: false
+      publish: always
+
+  merge:
+    needs: [bump, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward main
+        env:
+          BRANCH: ${{ needs.bump.outputs.branch }}
+        run: |
+          git fetch origin "$BRANCH"
+          git merge --ff-only "origin/$BRANCH"
+          git push origin HEAD:main
+          git push origin --delete "$BRANCH"

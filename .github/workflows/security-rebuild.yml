@@ -1,0 +1,24 @@
+# Daily rebuild without cache: fresh Alpine base image, upgraded packages
+# (PHP, nginx, OpenSSL, ...) and gosu. A new image is published only when the
+# content fingerprint changed, i.e. when a patched package actually landed.
+name: security-rebuild
+
+on:
+  schedule:
+    # Daily (GitHub cron cannot be read from build.config).
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-publish.yml
+    with:
+      ref: ${{ github.sha }}
+      no_cache: true
+      publish: if-changed

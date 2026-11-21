@@ -1,0 +1,13 @@
+# Integration test overrides: msmtpd and geoip-updater need real credentials,
+# so they are disabled and removed from Matomo's dependencies.
+services:
+  msmtpd:
+    profiles: ["disabled"]
+  geoip-updater:
+    profiles: ["disabled"]
+  matomo:
+    depends_on: !override
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

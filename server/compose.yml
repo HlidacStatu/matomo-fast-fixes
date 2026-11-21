@@ -1,0 +1,116 @@
+# Matomo stack for production servers.
+# All values come from .env next to this file (see .env.example); compose
+# fails fast (`:?`) when a required one is missing.
+#
+# Every service has a healthcheck, so `docker compose up --wait` (used by
+# matomo-update.sh) only returns once the stack really works.
+#
+# Do not set `pull_policy` here: matomo-update.sh relies on `up` using the
+# locally tagged image so that it can roll back by re-tagging.
+
+services:
+  db:
+    image: ${MARIADB_IMAGE:?}
+    command:
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_unicode_ci"
+      - "--max_allowed_packet=256M"
+    volumes:
+      - "${MATOMO_DATA_DIR:?}/db:/var/lib/mysql"
+    environment:
+      - "TZ=${TZ:?}"
+      # Only used when the data directory is initialised for the first time.
+      - "MARIADB_RANDOM_ROOT_PASSWORD=yes"
+      - "MYSQL_DATABASE=${MYSQL_DATABASE:?}"
+      - "MYSQL_USER=${MYSQL_USER:?}"
+      - "MYSQL_PASSWORD=${MYSQL_PASSWORD:?}"
+      # Runs mariadb-upgrade when the image is newer than the data directory.
+      - "MARIADB_AUTO_UPGRADE=1"
+    healthcheck:
+      # `ping` succeeds as soon as the server accepts connections, even
+      # without credentials, so it also works for data directories created
+      # by older images without the healthcheck user.
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 120s
+    restart: always
+
+  redis:
+    image: ${REDIS_IMAGE:?}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: always
+
+  msmtpd:
+    image: ${MSMTPD_IMAGE:?}
+    env_file:
+      - "./msmtpd.env"
+    environment:
+      - "TZ=${TZ:?}"
+    restart: always
+
+  geoip-updater:
+    image: ${GEOIP_UPDATER_IMAGE:?}
+    volumes:
+      - "${MATOMO_DATA_DIR:?}/geoip-updater:/data"
+    env_file:
+      - "./geoip-updater.env"
+    environment:
+      - "TZ=${TZ:?}"
+    restart: always
+
+  matomo:
+    image: ${MATOMO_IMAGE:?}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      msmtpd:
+        condition: service_started
+    ports:
+      - target: 8000
+        published: ${MATOMO_PUBLISHED_PORT:?}
+        protocol: tcp
+    volumes:
+      - "${MATOMO_DATA_DIR:?}/web:/data"
+      - "${MATOMO_DATA_DIR:?}/geoip-updater:/data/geoip"
+    env_file:
+      - "./matomo.env"
+    environment:
+      - "TZ=${TZ:?}"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      # Database migrations (core:update) run before nginx/php-fpm start and
+      # can take long on big databases. Failed probes during the start period
+      # do not count, so the container is not reported unhealthy mid-migration.
+      start_period: ${MATOMO_START_PERIOD:?}
+      start_interval: 5s
+    restart: always
+
+  cron:
+    image: ${MATOMO_IMAGE:?}
+    depends_on:
+      matomo:
+        condition: service_healthy
+    volumes:
+      - "${MATOMO_DATA_DIR:?}/web:/data"
+      - "${MATOMO_DATA_DIR:?}/geoip-updater:/data/geoip"
+    env_file:
+      - "./matomo.env"
+    environment:
+      - "TZ=${TZ:?}"
+      - "SIDECAR_CRON=1"
+      - "CRON_ARCHIVE=${CRON_ARCHIVE:?}"
+      - "ARCHIVE_OPTIONS=${ARCHIVE_OPTIONS:?}"
+    healthcheck:
+      disable: true
+    restart: always

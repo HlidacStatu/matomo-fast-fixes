@@ -1,0 +1,54 @@
+# Smoke test stack (adapted from crazy-max/docker-matomo test/compose.yml).
+# MATOMO_IMAGE is the candidate image built by the pipeline.
+name: matomo-smoke
+
+services:
+  db:
+    image: mariadb:10.11
+    command:
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_unicode_ci"
+      - "--max_allowed_packet=256M"
+    environment:
+      - "MARIADB_RANDOM_ROOT_PASSWORD=yes"
+      - "MYSQL_DATABASE=matomo"
+      - "MYSQL_USER=matomo"
+      - "MYSQL_PASSWORD=smoke-test"
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 --silent"]
+      interval: 5s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+
+  matomo:
+    image: ${MATOMO_IMAGE:?}
+    container_name: matomo-smoke
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    env_file:
+      - "./matomo.env"
+    environment:
+      - "PUID=1234"
+      - "PGID=1235"
+
+  cron:
+    image: ${MATOMO_IMAGE:?}
+    depends_on:
+      - matomo
+    env_file:
+      - "./matomo.env"
+    environment:
+      - "PUID=1234"
+      - "PGID=1235"
+      - "SIDECAR_CRON=1"
+      - "CRON_ARCHIVE=0 * * * *"
+      - "ARCHIVE_OPTIONS=--concurrent-requests-per-website=3"
+    healthcheck:
+      disable: true
