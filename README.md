@@ -85,7 +85,8 @@ Requirements: Docker Engine 25+ with the compose plugin (healthcheck
    chmod 600 .env msmtpd.env geoip-updater.env
    ```
 
-   Migrating from the crazymax compose file:
+   Migrating a running crazymax stack: follow [MIGRATION.md](MIGRATION.md)
+   (step-by-step, no data loss, about a minute of downtime). In short:
    - keep `MATOMO_DATA_DIR=/data/matomo` - the bind mount layout is the same,
    - set `COMPOSE_PROJECT_NAME` to the old project name (the old directory
      name) or run `docker compose down` in the old directory first,
