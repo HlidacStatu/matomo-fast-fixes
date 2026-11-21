@@ -106,7 +106,9 @@ cp "$REPO_DIR/server/matomo.env.example" "$WORK/matomo.env"
 printf 'IT_DB_PASSWORD=%s\n' "$IT_DB_PASSWORD" >>"$WORK/matomo.env"
 touch "$WORK/msmtpd.env" "$WORK/geoip-updater.env"
 sed -e "s|^COMPOSE_PROJECT_NAME=.*|COMPOSE_PROJECT_NAME=$IT_PROJECT_NAME|" \
-  -e "s|^MATOMO_DATA_DIR=.*|MATOMO_DATA_DIR=$WORK/data|" \
+  -e "s|^MATOMO_DB_DIR=.*|MATOMO_DB_DIR=$WORK/data/db|" \
+  -e "s|^MATOMO_WEB_DIR=.*|MATOMO_WEB_DIR=$WORK/data/web|" \
+  -e "s|^MATOMO_GEOIP_DIR=.*|MATOMO_GEOIP_DIR=$WORK/data/geoip-updater|" \
   -e "s|^MATOMO_IMAGE=.*|MATOMO_IMAGE=$TRACKED|" \
   -e "s|^MATOMO_START_PERIOD=.*|MATOMO_START_PERIOD=$IT_START_PERIOD|" \
   -e "s|^MYSQL_PASSWORD=.*|MYSQL_PASSWORD=$IT_DB_PASSWORD|" \

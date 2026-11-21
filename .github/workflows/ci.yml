@@ -35,7 +35,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
 
       - name: ShellCheck
-        run: shellcheck -x scripts/*.sh scripts/lib/*.sh server/*.sh test/smoke/run.sh test/integration/*.sh
+        run: shellcheck -x scripts/*.sh scripts/lib/*.sh server/*.sh server/lib/*.sh test/smoke/run.sh test/integration/*.sh test/migration/*.sh
 
       - name: Unit tests
         run: bats test/unit
@@ -78,8 +78,46 @@ jobs:
       - name: Update / rollback integration test
         run: test/integration/run.sh matomo:candidate
 
+  migration:
+    needs: lint-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load build config
+        run: scripts/build-config.sh >>"$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build candidate
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ env.TEST_PLATFORM }}
+          load: true
+          provenance: false
+          tags: matomo:candidate
+          build-args: |
+            ALPINE_VERSION=${{ env.ALPINE_VERSION }}
+            MATOMO_VERSION=${{ env.MATOMO_VERSION }}
+            MATOMO_DOWNLOAD_BASE_URL=${{ env.MATOMO_DOWNLOAD_BASE_URL }}
+            MATOMO_GPG_FINGERPRINT=${{ env.MATOMO_GPG_FINGERPRINT }}
+            UNIFONT_URL=${{ env.UNIFONT_URL }}
+            GEOIP_MMDB_BASE_URL=${{ env.GEOIP_MMDB_BASE_URL }}
+          labels: |
+            org.opencontainers.image.version=${{ env.MATOMO_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Migration from crazymax integration test
+        run: sudo test/migration/run.sh matomo:candidate
+
   build:
-    needs: [lint-test, integration]
+    needs: [lint-test, integration, migration]
     permissions:
       contents: read
       packages: write

@@ -16,7 +16,7 @@ services:
       - "--collation-server=utf8mb4_unicode_ci"
       - "--max_allowed_packet=256M"
     volumes:
-      - "${MATOMO_DATA_DIR:?}/db:/var/lib/mysql"
+      - "${MATOMO_DB_DIR:?}:/var/lib/mysql"
     environment:
       - "TZ=${TZ:?}"
       # Only used when the data directory is initialised for the first time.
@@ -57,7 +57,7 @@ services:
   geoip-updater:
     image: ${GEOIP_UPDATER_IMAGE:?}
     volumes:
-      - "${MATOMO_DATA_DIR:?}/geoip-updater:/data"
+      - "${MATOMO_GEOIP_DIR:?}:/data"
     env_file:
       - "./geoip-updater.env"
     environment:
@@ -78,8 +78,8 @@ services:
         published: ${MATOMO_PUBLISHED_PORT:?}
         protocol: tcp
     volumes:
-      - "${MATOMO_DATA_DIR:?}/web:/data"
-      - "${MATOMO_DATA_DIR:?}/geoip-updater:/data/geoip"
+      - "${MATOMO_WEB_DIR:?}:/data"
+      - "${MATOMO_GEOIP_DIR:?}:/data/geoip"
     env_file:
       - "./matomo.env"
     environment:
@@ -102,8 +102,8 @@ services:
       matomo:
         condition: service_healthy
     volumes:
-      - "${MATOMO_DATA_DIR:?}/web:/data"
-      - "${MATOMO_DATA_DIR:?}/geoip-updater:/data/geoip"
+      - "${MATOMO_WEB_DIR:?}:/data"
+      - "${MATOMO_GEOIP_DIR:?}:/data/geoip"
     env_file:
       - "./matomo.env"
     environment:

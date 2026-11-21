@@ -1,3 +1,5 @@
+# Template: @UPDATE_SCRIPT@ and @UPDATE_CONFIG@ are filled in by
+# server/install-timer.sh. Do not copy this file to /etc/systemd/system as is.
 [Unit]
 Description=Update the Matomo Docker stack (pull, backup, deploy, verify, rollback)
 Documentation=https://github.com/HlidacStatu/matomo-fast-fixes
@@ -7,7 +9,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/matomo-fast-fixes/server/matomo-update.sh /etc/matomo-update/matomo-update.env
+ExecStart=@UPDATE_SCRIPT@ @UPDATE_CONFIG@
 # Must be longer than WAIT_TIMEOUT_SECONDS plus a possible rollback.
 TimeoutStartSec=3h
 Nice=10

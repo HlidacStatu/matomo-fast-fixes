@@ -41,6 +41,12 @@ REQUIRED_COMMANDS=(docker jq flock gzip curl find)
 VERSION_LABEL=org.opencontainers.image.version
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+# One JSON line per event on stdout (journald).
+LOG_STDOUT_FORMAT=json
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=server/lib/log.sh
+source "$SCRIPT_DIR/lib/log.sh"
 
 # Parallel arrays describing the services of the stack (filled by collect_state).
 SERVICES=()
@@ -50,30 +56,6 @@ NEW_IDS=()
 CHANGED=()
 DB_BACKUP_FILE=""
 CONFIG_BACKUP_FILE=""
-
-# log LEVEL EVENT MESSAGE [KEY VALUE]...
-log() {
-  local level=$1 event=$2 message=$3
-  shift 3
-  local fields='{}'
-  while (($# >= 2)); do
-    fields=$(jq -c --arg k "$1" --arg v "$2" '. + {($k): $v}' <<<"$fields")
-    shift 2
-  done
-  local line
-  line=$(jq -nc \
-    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --arg level "$level" \
-    --arg event "$event" \
-    --arg message "$message" \
-    --arg run_id "$RUN_ID" \
-    --argjson fields "$fields" \
-    '{ts: $ts, level: $level, event: $event, message: $message, run_id: $run_id} + $fields')
-  printf '%s\n' "$line"
-  if [[ -n ${LOG_FILE:-} ]]; then
-    printf '%s\n' "$line" >>"$LOG_FILE"
-  fi
-}
 
 # Loads CONFIG_FILE and fails fast (exit 2) when any required key is missing.
 load_server_config() {
