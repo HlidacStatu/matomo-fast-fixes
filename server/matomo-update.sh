@@ -26,6 +26,8 @@
 # Exit codes: 0 = nothing to do or update succeeded,
 #             1 = update failed (rolled back or rollback failed - see log),
 #             2 = invalid configuration or environment.
+# Configuration variables are assigned by sourcing CONFIG_FILE:
+# shellcheck disable=SC2153
 set -euo pipefail
 
 REQUIRED_CONFIG=(
