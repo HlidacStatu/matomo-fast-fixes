@@ -3,3 +3,4 @@ server/.env
 server/*.env
 !server/*.env.example
 test/integration/work/
+test/smoke/compose.log
