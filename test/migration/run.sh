@@ -89,7 +89,8 @@ container_env_value() {
 
 migrate() {
   local status=0
-  "$MIGRATE" --yes --start-period "$IT_START_PERIOD" --wait-timeout "$IT_WAIT_TIMEOUT_SECONDS" "$@" || status=$?
+  # The script's own output goes to stderr (CI log); stdout carries the status.
+  "$MIGRATE" --yes --start-period "$IT_START_PERIOD" --wait-timeout "$IT_WAIT_TIMEOUT_SECONDS" "$@" >&2 || status=$?
   echo "$status"
 }
 
