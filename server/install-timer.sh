@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Installs and enables the systemd timer that runs matomo-update.sh.
 #
-#   - creates /etc/matomo-update/matomo-update.env from the example with the
-#     given values; an existing file is kept only when it already points to
-#     the same COMPOSE_DIR (otherwise the script stops instead of silently
-#     leaving the timer bound to another stack),
+#   - writes /etc/matomo-update/matomo-update.env from the example with the
+#     given values. An existing file is updated only when it points to the
+#     same COMPOSE_DIR (otherwise the script stops instead of silently leaving
+#     the timer bound to another stack): the four given values are replaced,
+#     its other values are kept and keys new in the example are added,
 #   - renders server/systemd/matomo-update.{service,timer} with the real path
 #     of this checkout into /etc/systemd/system,
 #   - enables and starts the timer and prints when it runs next.
@@ -27,16 +28,31 @@ die() {
   exit 1
 }
 
-# render_config EXAMPLE COMPOSE_DIR BACKUP_DIR HEALTH_URL WAIT_TIMEOUT_SECONDS
-# Prints the example with the given keys replaced. The file is sourced by
-# bash, so the values are quoted with printf %q.
+# config_value FILE KEY - KEY's value in an existing config (sourced in a
+# subshell); fails when the file does not set it.
+config_value() {
+  (
+    set +u
+    # shellcheck disable=SC1090
+    source "$1" >/dev/null 2>&1
+    [[ -n ${!2+set} ]] || exit 1
+    printf '%s' "${!2}"
+  )
+}
+
+# render_config EXAMPLE EXISTING COMPOSE_DIR BACKUP_DIR HEALTH_URL WAIT_TIMEOUT_SECONDS
+# Prints the example with the given keys replaced and, when EXISTING is a
+# file, every other key set to its value there. The file is sourced by bash,
+# so the values are quoted with printf %q.
 render_config() {
-  local example=$1 line key
-  local -A values=([COMPOSE_DIR]=$2 [BACKUP_DIR]=$3 [HEALTH_URL]=$4 [WAIT_TIMEOUT_SECONDS]=$5)
+  local example=$1 existing=$2 line key value
+  local -A values=([COMPOSE_DIR]=$3 [BACKUP_DIR]=$4 [HEALTH_URL]=$5 [WAIT_TIMEOUT_SECONDS]=$6)
   while IFS= read -r line || [[ -n $line ]]; do
     key=${line%%=*}
     if [[ $line == *=* && -n ${values[$key]+set} ]]; then
       printf '%s=%q\n' "$key" "${values[$key]}"
+    elif [[ $line == *=* && -f $existing ]] && value=$(config_value "$existing" "$key"); then
+      printf '%s=%q\n' "$key" "$value"
     else
       printf '%s\n' "$line"
     fi
@@ -85,18 +101,22 @@ main() {
   [[ -f $compose_dir/compose.yml ]] || die "no compose.yml in $compose_dir"
 
   install -d -m 700 "$CONFIG_DIR"
+  local existing="" action=Created tmp
   if [[ -f $CONFIG_FILE ]]; then
-    local existing
     existing=$(configured_compose_dir "$CONFIG_FILE")
     [[ $existing == "$compose_dir" ]] ||
       die "$CONFIG_FILE already points to COMPOSE_DIR=$existing, not $compose_dir; fix or remove it first"
-    echo "Keeping existing $CONFIG_FILE (already points to $compose_dir)"
-  else
-    render_config "$SCRIPT_DIR/matomo-update.env.example" "$compose_dir" "$backup_dir" "$health_url" "$wait_timeout" >"$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
-    [[ $(configured_compose_dir "$CONFIG_FILE") == "$compose_dir" ]] || die "rendered $CONFIG_FILE does not parse back"
-    echo "Created $CONFIG_FILE"
+    existing=$CONFIG_FILE
+    action=Updated
   fi
+  tmp=$(mktemp "$CONFIG_FILE.XXXXXX")
+  render_config "$SCRIPT_DIR/matomo-update.env.example" "$existing" \
+    "$compose_dir" "$backup_dir" "$health_url" "$wait_timeout" >"$tmp"
+  chmod 600 "$tmp"
+  [[ $(configured_compose_dir "$tmp") == "$compose_dir" ]] || { rm -f "$tmp"; die "rendered config does not parse back"; }
+  mv "$tmp" "$CONFIG_FILE"
+  echo "$action $CONFIG_FILE"
+
 
   (
     umask 022

@@ -13,7 +13,7 @@ setup() {
 
 @test "render_config quotes values so that the file sources back exactly" {
   file="$BATS_TEST_TMPDIR/matomo-update.env"
-  render_config "$SERVER_DIR/matomo-update.env.example" "/opt/Matomo Stack & co" '/data/$x/backups' \
+  render_config "$SERVER_DIR/matomo-update.env.example" "" "/opt/Matomo Stack & co" '/data/$x/backups' \
     'http://127.0.0.1:8000/matomo.php' 4000 >"$file"
   (
     source "$file"
@@ -27,8 +27,27 @@ setup() {
 
 @test "render_config keeps every key of the example" {
   file="$BATS_TEST_TMPDIR/matomo-update.env"
-  render_config "$SERVER_DIR/matomo-update.env.example" /opt/m /b http://x/ 1 >"$file"
+  render_config "$SERVER_DIR/matomo-update.env.example" "" /opt/m /b http://x/ 1 >"$file"
   [ "$(grep -cE '^[A-Z_]+=' "$file")" = "$(grep -cE '^[A-Z_]+=' "$SERVER_DIR/matomo-update.env.example")" ]
+}
+
+@test "render_config on an existing config replaces the given keys and keeps the others" {
+  old="$BATS_TEST_TMPDIR/old.env"
+  printf '%s\n' 'COMPOSE_DIR=/opt/m' 'WAIT_TIMEOUT_SECONDS=2400' 'BACKUP_RETENTION_DAYS=30' "HEALTH_URL='http://old/'" >"$old"
+  file="$BATS_TEST_TMPDIR/new.env"
+  render_config "$SERVER_DIR/matomo-update.env.example" "$old" /opt/m /b 'http://127.0.0.1:8000/matomo.php' 4000 >"$file"
+  (
+    source "$file"
+    [ "$WAIT_TIMEOUT_SECONDS" = 4000 ]
+    [ "$HEALTH_URL" = 'http://127.0.0.1:8000/matomo.php' ]
+    [ "$BACKUP_RETENTION_DAYS" = 30 ]
+    # keys missing in the old file come from the example
+    [ "$APP_SERVICE" = matomo ]
+  )
+}
+
+@test "the service unit gives a rollback time to finish after SIGTERM" {
+  grep -qE '^TimeoutStopSec=[1-9]' "$SERVER_DIR/systemd/matomo-update.service"
 }
 
 @test "systemd_quote escapes quotes, backslashes and specifiers" {

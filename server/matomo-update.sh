@@ -16,9 +16,10 @@
 #
 # If any step fails or the run is interrupted (signal, unexpected error), the
 # previous images are re-tagged locally, the config is restored, the database
-# is restored from the step 1 dump only when its schema fingerprint changed
-# (i.e. migrations ran - otherwise the live data is kept, see server/lib/db.sh),
-# the stack is started again and the failed image IDs are recorded in
+# is restored from the step 1 dump when the Matomo version changed or the
+# schema fingerprint changed (otherwise - e.g. a security rebuild of the same
+# Matomo version - the live data is kept, see db_restore_needed in
+# server/lib/db.sh), the stack is started again and the failed image IDs are recorded in
 # STATE_DIR so that later runs do not retry the same broken image.
 # A new upstream image (different ID) is tried normally.
 #
@@ -55,6 +56,8 @@ source "$SCRIPT_DIR/lib/log.sh"
 source "$SCRIPT_DIR/lib/db.sh"
 # shellcheck source=server/lib/matomo-config.sh
 source "$SCRIPT_DIR/lib/matomo-config.sh"
+# shellcheck source=server/lib/host.sh
+source "$SCRIPT_DIR/lib/host.sh"
 # Matomo's table prefix when config.ini.php does not set one (Matomo default).
 MATOMO_DEFAULT_TABLE_PREFIX=matomo_
 
@@ -104,7 +107,8 @@ load_server_config() {
 # otherwise a long database migration is cut off and rolled back.
 check_start_period() {
   local value seconds
-  value=$(grep -E '^MATOMO_START_PERIOD=' "$COMPOSE_DIR/.env" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "'\"") || true
+  value=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?MATOMO_START_PERIOD[[:space:]]*=[[:space:]]*//p' "$COMPOSE_DIR/.env" 2>/dev/null |
+    tail -n1 | tr -d "'\"") || true
   [[ -n $value ]] || return 0
   if [[ ! $value =~ ^([0-9]+)([smh])$ ]]; then
     log error config_invalid "MATOMO_START_PERIOD in .env is not a duration like 1800s" value "$value"
@@ -214,6 +218,17 @@ collect_state() {
     REFS+=("$ref")
     OLD_IDS+=("$(container_image_id "$svc")")
   done < <(docker compose config --services)
+  # A rollback re-tags each reference to one image ID; services sharing a
+  # reference (matomo and cron) must therefore run the same image.
+  local i conflicts
+  conflicts=$(for i in "${!SERVICES[@]}"; do
+    [[ -z ${OLD_IDS[$i]} ]] || echo "${SERVICES[$i]} ${REFS[$i]} ${OLD_IDS[$i]}"
+  done | conflicting_shared_images)
+  if [[ -n $conflicts ]]; then
+    log error state_invalid "services sharing an image reference run different images; recreate them first" \
+      images "$conflicts" hint "docker compose up -d --pull never --force-recreate"
+    exit 1
+  fi
   local required
   for required in "$APP_SERVICE" "$CRON_SERVICE" "$DB_SERVICE"; do
     if ! service_index "$required" >/dev/null; then
@@ -272,10 +287,9 @@ restore_tags() {
 check_backup_space() {
   local need free
   need=$(db_size_sql | docker compose exec -T "$DB_SERVICE" sh -c "$DB_CLIENT_SNIPPET") || return 1
-  free=$(df -Pk "$BACKUP_DIR" | awk 'NR == 2 { print $4 * 1024 }')
-  if ((free < need)); then
-    log error backup_failed "not enough free space for the database dump" dir "$BACKUP_DIR" \
-      free_bytes "$free" database_bytes "$need"
+  if ! free=$(has_enough_space "$BACKUP_DIR" "$need"); then
+    log error backup_failed "not enough free space for the database dump (or it cannot be measured)" \
+      dir "$BACKUP_DIR" free_bytes "$free" database_bytes "$need"
     return 1
   fi
 }
@@ -287,20 +301,16 @@ create_backup() {
   DB_BACKUP_FILE="$BACKUP_DIR/matomo-db-$RUN_ID.sql.gz"
   CONFIG_BACKUP_FILE="$BACKUP_DIR/matomo-config-$RUN_ID.tar.gz"
 
-  # Variables are expanded inside the db container (MYSQL_* / MARIADB_* of the image).
-  # shellcheck disable=SC2016
-  if ! docker compose exec -T "$DB_SERVICE" sh -c '
-      MYSQL_PWD="${MARIADB_PASSWORD:-$MYSQL_PASSWORD}" exec mariadb-dump \
-        --single-transaction --quick --add-drop-database \
-        -u"${MARIADB_USER:-$MYSQL_USER}" \
-        --databases "${MARIADB_DATABASE:-$MYSQL_DATABASE}"' |
-    gzip >"$DB_BACKUP_FILE.partial"; then
+  # A failed dump must not leave a partial file that fills the disk.
+  if ! docker compose exec -T "$DB_SERVICE" sh -c "$DB_DUMP_SNIPPET" | gzip >"$DB_BACKUP_FILE.partial"; then
+    rm -f "$DB_BACKUP_FILE.partial"
     log error backup_failed "database dump failed"
     return 1
   fi
   if ! gzip -t "$DB_BACKUP_FILE.partial" ||
     ! gzip -dc "$DB_BACKUP_FILE.partial" | tail -n1 | grep -q '^-- Dump completed'; then
-    log error backup_failed "database dump is incomplete" file "$DB_BACKUP_FILE.partial"
+    rm -f "$DB_BACKUP_FILE.partial"
+    log error backup_failed "database dump is incomplete"
     return 1
   fi
   mv "$DB_BACKUP_FILE.partial" "$DB_BACKUP_FILE"
@@ -312,6 +322,7 @@ create_backup() {
   if ! docker run --rm --volumes-from "$app_cid" --entrypoint tar "$app_old_id" \
     -C /data -czf - config >"$CONFIG_BACKUP_FILE.partial" ||
     ! gzip -t "$CONFIG_BACKUP_FILE.partial"; then
+    rm -f "$CONFIG_BACKUP_FILE.partial"
     log error backup_failed "config backup failed"
     return 1
   fi
@@ -332,7 +343,7 @@ create_backup() {
 read_matomo_config() {
   local ini prefix
   ini=$(mktemp)
-  if tar -xzOf "$1" config/config.ini.php >"$ini" 2>/dev/null && grep -q '^\[database\]' "$ini"; then
+  if tar -xzOf "$1" config/config.ini.php >"$ini" 2>/dev/null && grep -qE '^[[:space:]]*\[database\]' "$ini"; then
     MATOMO_INSTALLED=true
     prefix=$(ini_value "$ini" database tables_prefix)
     [[ -z $prefix ]] || TABLE_PREFIX=$prefix
@@ -374,7 +385,7 @@ verify_app() {
     return 1
   fi
 
-  if docker compose exec -T "$APP_SERVICE" sh -c 'grep -q "^\[database\]" /data/config/config.ini.php' 2>/dev/null; then
+  if docker compose exec -T "$APP_SERVICE" sh -c 'grep -qE "^[[:space:]]*\[database\]" /data/config/config.ini.php' 2>/dev/null; then
     if ! output=$(docker compose exec -T "$APP_SERVICE" console core:update --yes --no-interaction 2>&1); then
       log error verify_failed "core:update failed" output "$output"
       return 1
@@ -401,24 +412,37 @@ apply_update() {
   fi
 }
 
+# Prints the Matomo version label of an image (empty when it has none).
+image_version() {
+  local v
+  v=$(docker image inspect --format "{{ index .Config.Labels \"$VERSION_LABEL\" }}" "$1" 2>/dev/null) || v=""
+  [[ $v == "<no value>" ]] && v=""
+  printf '%s' "$v"
+}
+
 restore_backup() {
-  local app_cid app_old_id
+  local app_cid app_old_id i old_version new_version same_version=false db_restored=false
   if ! docker compose up --pull never -d --wait --wait-timeout "$WAIT_TIMEOUT_SECONDS" "$DB_SERVICE"; then
     log error restore_failed "database service did not start"
     return 1
   fi
+  i=$(service_index "$APP_SERVICE")
+  old_version=$(image_version "${OLD_IDS[$i]}")
+  new_version=$(image_version "${NEW_IDS[$i]}")
+  [[ -n $old_version && $old_version == "$new_version" ]] && same_version=true
   local post
   post=$(db_fingerprint_sql "$TABLE_PREFIX" "$MATOMO_INSTALLED" |
     docker compose exec -T "$DB_SERVICE" sh -c "$DB_CLIENT_SNIPPET") || post=""
-  if [[ -n $post && $post == "$PRE_DB_FINGERPRINT" ]]; then
-    log info db_unchanged "database schema unchanged, keeping all data (no restore)"
-  else
-    log warn db_restore "database schema changed, restoring the dump; data tracked since the backup is discarded" \
-      before "$PRE_DB_FINGERPRINT" after "$post"
+  if db_restore_needed "$PRE_DB_FINGERPRINT" "$post" "$same_version"; then
+    log warn db_restore "restoring the dump (Matomo version or schema changed); data tracked since the backup is discarded" \
+      matomo_from "$old_version" matomo_to "$new_version" before "$PRE_DB_FINGERPRINT" after "$post"
     if ! gzip -dc "$DB_BACKUP_FILE" | docker compose exec -T "$DB_SERVICE" sh -c "$DB_CLIENT_SNIPPET"; then
       log error restore_failed "database restore failed" file "$DB_BACKUP_FILE"
       return 1
     fi
+    db_restored=true
+  else
+    log info db_unchanged "same Matomo version and schema, keeping all data (no restore)" matomo_version "$old_version"
   fi
   app_cid=$(docker compose ps -a -q "$APP_SERVICE" | head -n1)
   app_old_id=${OLD_IDS[$(service_index "$APP_SERVICE")]}
@@ -435,13 +459,16 @@ restore_backup() {
     log error restore_failed "config restore failed" file "$CONFIG_BACKUP_FILE"
     return 1
   fi
-  log info restore_succeeded "database and config are in the pre-update state" db_backup "$DB_BACKUP_FILE"
+  log info restore_succeeded "config restored, database restored or unchanged" \
+    db_restored "$db_restored" db_backup "$DB_BACKUP_FILE"
 }
 
 # Reverts to the previously running images and restores the backup. Always exits 1.
 rollback() {
   local svc i
   PHASE=rolling_back
+  # A second signal (or systemd's stop) must not cut a restore in half.
+  trap '' INT TERM HUP
   log warn rollback_started "rolling back to previous images" services "${CHANGED[*]}"
   for svc in "${CHANGED[@]}"; do
     i=$(service_index "$svc")
@@ -482,7 +509,7 @@ clean_compose_environment() {
   local var
   while IFS= read -r var; do
     [[ " ${REQUIRED_CONFIG[*]} " == *" $var "* ]] || unset "$var"
-  done < <({ compgen -e | grep -E '^COMPOSE_'; [[ ! -f .env ]] || grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' .env | tr -d =; } || true)
+  done < <({ compgen -e | grep -E '^COMPOSE_'; [[ ! -f .env ]] || dotenv_keys .env; } || true)
 }
 
 # EXIT trap: an interruption must not leave the stack half updated.

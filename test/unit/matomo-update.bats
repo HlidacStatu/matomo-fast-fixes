@@ -103,3 +103,19 @@ setup() {
   [ -z "${COMPOSE_FILE:-}" ]
   [ -z "${MATOMO_IMAGE:-}" ]
 }
+
+@test "clean_compose_environment also unsets keys written as 'KEY = value' or 'export KEY='" {
+  cd "$BATS_TEST_TMPDIR"
+  printf '%s\n' 'MYSQL_PASSWORD = file-value' 'export MATOMO_IMAGE=x' '  TZ=UTC' '# COMMENTED=1' >.env
+  export MYSQL_PASSWORD=shell MATOMO_IMAGE=shell TZ=shell COMMENTED=keep
+  clean_compose_environment
+  [ -z "${MYSQL_PASSWORD:-}" ]
+  [ -z "${MATOMO_IMAGE:-}" ]
+  [ -z "${TZ:-}" ]
+  [ "$COMMENTED" = keep ]
+}
+
+@test "the database dump falls back to mysqldump for old MariaDB images" {
+  [[ "$DB_DUMP_SNIPPET" == *"command -v mariadb-dump"*"dump=mysqldump"* ]]
+  ! grep -q 'exec mariadb-dump' "$SCRIPT"
+}

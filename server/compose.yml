@@ -31,8 +31,9 @@ services:
     healthcheck:
       # `ping` succeeds as soon as the server accepts connections, even
       # without credentials, so it also works for data directories created
-      # by older images without the healthcheck user.
-      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 --silent"]
+      # by older images without the healthcheck user. Images before 10.4 only
+      # ship mysqladmin (the migration keeps the running MariaDB image).
+      test: ["CMD-SHELL", "admin=mariadb-admin; command -v $$admin >/dev/null 2>&1 || admin=mysqladmin; $$admin ping -h 127.0.0.1 --silent"]
       interval: 10s
       timeout: 5s
       retries: 6

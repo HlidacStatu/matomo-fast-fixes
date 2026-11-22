@@ -210,11 +210,109 @@ setup() {
 @test "db_fingerprint_sql escapes the prefix and includes versions only when installed" {
   run db_fingerprint_sql matomo_ true
   [ "$status" -eq 0 ]
-  [[ "$output" == *"NOT LIKE 'matomo\_archive\_%'"* ]]
+  # only the rotating monthly archive tables are excluded
+  [[ "$output" == *"NOT LIKE 'matomo\_archive\_numeric\_%'"* ]]
+  [[ "$output" == *"NOT LIKE 'matomo\_archive\_blob\_%'"* ]]
+  [[ "$output" != *"NOT LIKE 'matomo\_archive\_%'"* ]]
+  [[ "$output" == *"information_schema.statistics"* ]]
   [[ "$output" == *'`matomo_option`'* ]]
   [[ "$output" == *"LIKE 'version\_%'"* ]]
   run db_fingerprint_sql matomo_ false
   [[ "$output" != *option* ]]
   run db_fingerprint_sql "x'; DROP" true
   [ "$status" -ne 0 ]
+}
+
+@test "ini_has_plugin and ini_value accept indented lines" {
+  ini="$BATS_TEST_TMPDIR/config.ini.php"
+  printf '%s\n' '  [database]' '  password = "secret"' ' [Plugins]' '  Plugins[] = "QueuedTracking"' >"$ini"
+  ini_has_plugin "$ini" QueuedTracking
+  [ "$(ini_value "$ini" database password)" = secret ]
+}
+
+@test "db_restore_needed trusts a fingerprint match only for the same Matomo version" {
+  run db_restore_needed abc abc true
+  [ "$status" -eq 1 ]
+  # Matomo upgraded: always restore
+  run db_restore_needed abc abc false
+  [ "$status" -eq 0 ]
+  # schema changed
+  run db_restore_needed abc def true
+  [ "$status" -eq 0 ]
+  # fingerprint could not be computed after the switch
+  run db_restore_needed abc "" true
+  [ "$status" -eq 0 ]
+}
+
+@test "has_enough_space works in integers and fails closed" {
+  free=$(free_bytes "$BATS_TEST_TMPDIR")
+  [[ $free =~ ^[0-9]+$ ]]
+  has_enough_space "$BATS_TEST_TMPDIR" 1 >/dev/null
+  # more than any disk: 2^62 bytes
+  run has_enough_space "$BATS_TEST_TMPDIR" 4611686018427387904
+  [ "$status" -ne 0 ]
+  run has_enough_space "$BATS_TEST_TMPDIR" 3.14573e+09
+  [ "$status" -ne 0 ]
+  run has_enough_space "$BATS_TEST_TMPDIR" ""
+  [ "$status" -ne 0 ]
+  run has_enough_space "$BATS_TEST_TMPDIR/missing" 1
+  [ "$status" -ne 0 ]
+}
+
+@test "conflicting_shared_images reports a reference shared by different image IDs" {
+  run conflicting_shared_images <<<"$(printf '%s\n' 'matomo crazymax/matomo:latest sha256:a' \
+    'cron crazymax/matomo:latest sha256:b' 'db mariadb:10.4 sha256:c' 'redis redis:4 sha256:c')"
+  [ "$output" = crazymax/matomo:latest ]
+  run conflicting_shared_images <<<"$(printf '%s\n' 'matomo m:1 sha256:a' 'cron m:1 sha256:a')"
+  [ -z "$output" ]
+}
+
+@test "is_missing_tag_error separates a missing tag from network errors" {
+  is_missing_tag_error 'Error response from daemon: failed to resolve reference "ghcr.io/x/matomo:5.0.0": ghcr.io/x/matomo:5.0.0: not found'
+  is_missing_tag_error 'Error response from daemon: manifest for ghcr.io/x/matomo:5.0.0 not found: manifest unknown: manifest unknown'
+  run is_missing_tag_error 'Error response from daemon: Get "https://ghcr.io/v2/": dial tcp: lookup ghcr.io: no such host'
+  [ "$status" -ne 0 ]
+  run is_missing_tag_error 'toomanyrequests: You have reached your pull rate limit'
+  [ "$status" -ne 0 ]
+}
+
+@test "cleanup_new_dir empties a pre-existing NEW_DIR and removes a created one" {
+  NEW_DIR="$BATS_TEST_TMPDIR/existing"
+  mkdir "$NEW_DIR"
+  touch "$NEW_DIR/.env" "$NEW_DIR/compose.yml"
+  NEW_DIR_WRITTEN=true NEW_DIR_CREATED=false
+  cleanup_new_dir
+  [ -d "$NEW_DIR" ]
+  [ -z "$(ls -A "$NEW_DIR")" ]
+  NEW_DIR_CREATED=true
+  cleanup_new_dir
+  [ ! -e "$NEW_DIR" ]
+  # nothing written by this run: nothing touched
+  NEW_DIR="$BATS_TEST_TMPDIR/other"
+  mkdir "$NEW_DIR"
+  touch "$NEW_DIR/keep"
+  NEW_DIR_WRITTEN=false
+  cleanup_new_dir
+  [ -f "$NEW_DIR/keep" ]
+}
+
+@test "finalize_env switches all image lines at once or leaves .env untouched (exit 3)" {
+  # The only external call is the `docker compose config` validation.
+  docker() { return 0; }
+  NEW_DIR="$BATS_TEST_TMPDIR/new"
+  mkdir "$NEW_DIR"
+  printf "%s\n" "MATOMO_IMAGE='ghcr.io/x/matomo:5.14.1'" "MARIADB_IMAGE='mariadb@sha256:1'" "TZ='UTC'" >"$NEW_DIR/.env"
+  FINAL_IMAGES=([MATOMO_IMAGE]=ghcr.io/x/matomo:5 [MARIADB_IMAGE]=mariadb:10.11)
+  finalize_env
+  grep -qx "MATOMO_IMAGE='ghcr.io/x/matomo:5'" "$NEW_DIR/.env"
+  grep -qx "MARIADB_IMAGE='mariadb:10.11'" "$NEW_DIR/.env"
+  grep -qx "TZ='UTC'" "$NEW_DIR/.env"
+  grep -q '^# .*matomo-update' "$NEW_DIR/.env"
+  [ "$(stat -c %a "$NEW_DIR/.env")" = "600" ]
+
+  before=$(cat "$NEW_DIR/.env")
+  FINAL_IMAGES=([MATOMO_IMAGE]=ghcr.io/x/matomo:6 [MARIADB_IMAGE]="it's")
+  run finalize_env
+  [ "$status" -eq 3 ]
+  [ "$(cat "$NEW_DIR/.env")" = "$before" ]
 }

@@ -27,11 +27,14 @@
 #   of the *same* Matomo version when it is published. The database is then
 #   not migrated at all, and a rollback needs no restore. Afterwards .env is
 #   pointed at the tracked image lines; matomo-update.sh (systemd timer)
-#   upgrades them with its own backup, verification and rollback.
+#   upgrades them with its own backup, verification and rollback. Until that
+#   run, .env is ahead of the running containers: a plain `docker compose up`
+#   would pull and recreate them without a backup.
 #
 #   1. checks (no downtime): all six services run (db, redis, msmtpd,
 #      geoip-updater, matomo, cron) with the default network, commands and no
-#      extra labels; only bind mounts hold data; Matomo's config.ini.php uses
+#      extra labels; services sharing an image reference run the same image;
+#      only bind mounts hold data; Matomo's config.ini.php uses
 #      the db service credentials; QueuedTracking is not active; the Matomo
 #      major version matches; Docker Engine is recent enough,
 #   2. generates NEW_DIR from the *running* containers (environment minus
@@ -50,14 +53,18 @@
 # If step 5 or 6 fails, or the script is interrupted (signal, unexpected
 # error), it rolls back: the new containers are removed, the files are moved
 # back from _old_, the old images are re-tagged, the database is restored
-# from the step 4 dump only if its schema fingerprint changed, the config is
-# restored and the old stack is started and checked.
+# from the step 4 dump when the switch upgraded Matomo or the schema
+# fingerprint changed (see db_restore_needed in server/lib/db.sh), the config
+# is restored and the old stack is started and checked. A second signal
+# during the rollback is ignored.
 # A power loss in step 5/6 is not handled automatically: OLD_DIR/_old_ and
 # NEW_DIR/migration.log show where it stopped (see MIGRATION.md).
 #
 # Exit codes: 0 migrated, 1 failed and rolled back (or nothing was changed),
 #             2 rollback failed (manual intervention, see log),
-#             3 migrated but the timer could not be installed.
+#             3 migrated (the new stack runs), but finishing failed: .env
+#               could not be pointed at the tracked lines or the timer could
+#               not be installed (see log).
 set -euo pipefail
 # Dumps, archives and generated env files hold credentials.
 umask 077
@@ -69,6 +76,8 @@ source "$SCRIPT_DIR/lib/log.sh"
 source "$SCRIPT_DIR/lib/db.sh"
 # shellcheck source=server/lib/matomo-config.sh
 source "$SCRIPT_DIR/lib/matomo-config.sh"
+# shellcheck source=server/lib/host.sh
+source "$SCRIPT_DIR/lib/host.sh"
 # shellcheck source=scripts/lib/version.sh
 source "$SCRIPT_DIR/../scripts/lib/version.sh"
 
@@ -117,7 +126,9 @@ PRE_DB_FINGERPRINT=""
 SAME_MATOMO_VERSION=false
 SWITCH_STARTED_AT=0
 DRY_RUN_DIR=""
+# NEW_DIR did not exist before (removed as a whole) / this run wrote into it.
 NEW_DIR_CREATED=false
+NEW_DIR_WRITTEN=false
 # idle | backup | switching | rolling_back | switched - drives the EXIT trap.
 PHASE=idle
 # Values written to .env for the switch.
@@ -433,6 +444,15 @@ inspect_old_stack() {
     check_runtime "$svc" "$cid"
   done
 
+  # A rollback re-tags each old reference to one image ID.
+  local conflicts
+  conflicts=$(for svc in "${SERVICES[@]}"; do
+    echo "$svc ${OLD_IMAGE_REF[$svc]} ${OLD_IMAGE_ID[$svc]}"
+  done | conflicting_shared_images)
+  [[ -z $conflicts ]] ||
+    fail old_stack_invalid "services sharing an image reference run different images; recreate the old stack first" \
+      images "$conflicts" hint "docker compose up -d --force-recreate in OLD_DIR"
+
   # Exact old images for the switch.
   for svc in "${!PINNED_IMAGE_KEYS[@]}"; do
     local pinned
@@ -539,12 +559,13 @@ inspect_old_stack() {
 
   # Matomo's own database settings must match, otherwise backups are empty.
   local ini="$web_dir/config/config.ini.php"
-  if [[ -f $ini ]] && grep -q '^\[database\]' "$ini"; then
+  if [[ -f $ini ]] && grep -qE '^[[:space:]]*\[database\]' "$ini"; then
     MATOMO_INSTALLED=true
-    local host user dbname prefix
+    local host user dbname prefix password
     host=$(ini_value "$ini" database host)
     user=$(ini_value "$ini" database username)
     dbname=$(ini_value "$ini" database dbname)
+    password=$(ini_value "$ini" database password)
     prefix=$(ini_value "$ini" database tables_prefix)
     [[ -z $prefix ]] || TABLE_PREFIX=$prefix
     if [[ $host != db || $user != "${ENV_VALUES[MYSQL_USER]}" || $dbname != "${ENV_VALUES[MYSQL_DATABASE]}" ]]; then
@@ -552,6 +573,9 @@ inspect_old_stack() {
         ini_host "$host" ini_username "$user" ini_dbname "$dbname" \
         db_user "${ENV_VALUES[MYSQL_USER]}" db_database "${ENV_VALUES[MYSQL_DATABASE]}"
     fi
+    [[ $password == "${ENV_VALUES[MYSQL_PASSWORD]}" ]] ||
+      fail credentials_mismatch "the password in config.ini.php differs from the db service password"
+
     # Redis then holds unprocessed tracking requests; recreating the
     # container (no persistence in the crazymax setup) would drop them.
     if ini_has_plugin "$ini" QueuedTracking; then
@@ -605,9 +629,14 @@ fill_defaults_from_example() {
 # Chooses the Matomo image for the switch: this repository's image of the
 # running Matomo version when published, otherwise the tracked image.
 select_matomo_image() {
-  local tracked=${FINAL_IMAGES[MATOMO_IMAGE]} same_version label
+  local tracked=${FINAL_IMAGES[MATOMO_IMAGE]} same_version label output
   same_version="$(image_repository "$tracked"):$OLD_MATOMO_VERSION"
-  if docker pull -q "$same_version" >/dev/null 2>&1; then
+  # Only a missing tag means "not published"; any other pull error (network,
+  # rate limit) must not silently turn the switch into an upgrade.
+  if ! output=$(docker pull -q "$same_version" 2>&1); then
+    is_missing_tag_error "$output" ||
+      fail pull_failed "cannot pull the Matomo image of the running version" image "$same_version" output "$output"
+  else
     label=$(docker image inspect --format "{{ index .Config.Labels \"$VERSION_LABEL\" }}" "$same_version")
     if [[ $label == "$OLD_MATOMO_VERSION" ]]; then
       ENV_VALUES[MATOMO_IMAGE]=$same_version
@@ -627,6 +656,11 @@ select_matomo_image() {
   fi
   ENV_VALUES[MATOMO_IMAGE]=$tracked
   NEW_MATOMO_VERSION=$label
+  if [[ $label == "$OLD_MATOMO_VERSION" ]]; then
+    SAME_MATOMO_VERSION=true
+    log info matomo_image_selected "the tracked image has the running Matomo version, no database migration" image "$tracked"
+    return 0
+  fi
   log warn matomo_image_selected "no image of the running Matomo version, the switch also upgrades Matomo (database migrations)" \
     image "$tracked" from "$OLD_MATOMO_VERSION" to "$label"
 }
@@ -634,8 +668,9 @@ select_matomo_image() {
 # Writes compose.yml, .env and the env files into DIR.
 generate_config() {
   local dir=$1 key
-  if [[ $dir == "$NEW_DIR" && ! -e $dir ]]; then
-    NEW_DIR_CREATED=true
+  if [[ $dir == "$NEW_DIR" ]]; then
+    [[ -e $dir ]] || NEW_DIR_CREATED=true
+    NEW_DIR_WRITTEN=true
   fi
   mkdir -p "$dir"
   chmod 700 "$dir"
@@ -727,10 +762,9 @@ confirm() {
 check_backup_space() {
   local need free
   need=$(db_size_sql | db_query "${OLD_CID[db]}") || return 1
-  free=$(df -Pk "$BACKUP_DIR" | awk 'NR == 2 { print $4 * 1024 }')
-  if ((free < need)); then
-    log error backup_space "not enough free space for the database dump" dir "$BACKUP_DIR" \
-      free_bytes "$free" database_bytes "$need"
+  if ! free=$(has_enough_space "$BACKUP_DIR" "$need"); then
+    log error backup_space "not enough free space for the database dump (or it cannot be measured)" \
+      dir "$BACKUP_DIR" free_bytes "$free" database_bytes "$need"
     return 1
   fi
   if [[ $(df -P "$BACKUP_DIR" | awk 'NR == 2 { print $1 }') == $(df -P "${ENV_VALUES[MATOMO_DB_DIR]}" | awk 'NR == 2 { print $1 }') ]]; then
@@ -744,17 +778,11 @@ create_backup() {
   DB_BACKUP_FILE="$BACKUP_DIR/matomo-db-$RUN_ID-pre-migration.sql.gz"
   local partial="$DB_BACKUP_FILE.partial"
   CONFIG_BACKUP_FILE="$BACKUP_DIR/matomo-config-$RUN_ID-pre-migration.tar.gz"
-  # shellcheck disable=SC2016
-  if ! docker exec "${OLD_CID[db]}" sh -c '
-      dump=mariadb-dump; command -v mariadb-dump >/dev/null 2>&1 || dump=mysqldump
-      MYSQL_PWD="${MARIADB_PASSWORD:-$MYSQL_PASSWORD}" exec "$dump" \
-        --single-transaction --quick --add-drop-database \
-        -u"${MARIADB_USER:-$MYSQL_USER}" --databases "${MARIADB_DATABASE:-$MYSQL_DATABASE}"' |
-    gzip >"$partial"; then
+  if ! docker exec "${OLD_CID[db]}" sh -c "$DB_DUMP_SNIPPET" | gzip >"$partial" ||
+    ! gzip -t "$partial" || ! gzip -dc "$partial" | tail -n1 | grep -q '^-- Dump completed'; then
+    rm -f "$partial"
     return 1
   fi
-  gzip -t "$partial" || return 1
-  gzip -dc "$partial" | tail -n1 | grep -q '^-- Dump completed' || return 1
   local tables
   tables=$(gzip -dc "$partial" | grep -c '^CREATE TABLE' || true)
   if $MATOMO_INSTALLED && ((tables == 0)); then
@@ -864,6 +892,8 @@ remove_project_containers() {
 
 rollback() {
   PHASE=rolling_back
+  # A second signal must not cut a restore in half.
+  trap '' INT TERM HUP
   log warn rollback_started "rolling back to the old stack"
   if ! remove_project_containers; then
     log error rollback_failed "containers of the project could not be removed, database left untouched"
@@ -884,11 +914,11 @@ rollback() {
   fi
   local post
   post=$(db_fingerprint_sql "$TABLE_PREFIX" "$MATOMO_INSTALLED" | db_query "$(old_db_cid)") || post=""
-  if [[ -n $post && $post == "$PRE_DB_FINGERPRINT" ]]; then
-    log info db_unchanged "database schema unchanged, keeping all data (no restore)"
+  if ! db_restore_needed "$PRE_DB_FINGERPRINT" "$post" "$SAME_MATOMO_VERSION"; then
+    log info db_unchanged "same Matomo version and schema, keeping all data (no restore)"
   else
-    log warn db_restore "database schema changed, restoring the pre-migration dump; data tracked since the backup is discarded" \
-      before "$PRE_DB_FINGERPRINT" after "$post"
+    log warn db_restore "restoring the pre-migration dump (Matomo upgraded or schema changed); data tracked since the backup is discarded" \
+      same_matomo_version "$SAME_MATOMO_VERSION" before "$PRE_DB_FINGERPRINT" after "$post"
     if ! gzip -dc "$DB_BACKUP_FILE" | old_compose exec -T db sh -c "$DB_CLIENT_SNIPPET"; then
       log error rollback_failed "database restore failed" db_backup "$DB_BACKUP_FILE"
       exit 2
@@ -911,22 +941,39 @@ rollback() {
 # stack half switched.
 on_exit() {
   local status=$?
-  # Nothing was switched: leave no half-prepared NEW_DIR behind, so that the
-  # migration can simply be started again.
-  if [[ $PHASE == idle && $status -ne 0 ]] && $NEW_DIR_CREATED; then
-    rm -rf "$NEW_DIR"
-  fi
   case $PHASE in
+    idle)
+      [[ $status -eq 0 ]] || cleanup_new_dir
+      ;;
     backup)
       old_compose start cron >/dev/null 2>&1 || true
       log error interrupted "interrupted before the switch, old cron restarted" status "$status"
+      cleanup_new_dir
       ;;
     switching)
       log error interrupted "interrupted during the switch, rolling back" status "$status"
       rollback
       ;;
+    switched)
+      if [[ $status -ne 0 && $status -ne 3 ]]; then
+        log error finish_failed "the new stack runs, but the migration could not be finished" status "$status"
+        exit 3
+      fi
+      ;;
   esac
   [[ -z $DRY_RUN_DIR ]] || rm -rf "$DRY_RUN_DIR"
+}
+
+# Nothing was switched: leave no half-prepared NEW_DIR behind (only what this
+# run wrote; a pre-existing NEW_DIR was empty), so that the migration can
+# simply be started again. The log of the run stays on stdout.
+cleanup_new_dir() {
+  $NEW_DIR_WRITTEN || return 0
+  if $NEW_DIR_CREATED; then
+    rm -rf "$NEW_DIR"
+  else
+    find "$NEW_DIR" -mindepth 1 -delete
+  fi
 }
 
 switch() {
@@ -961,16 +1008,33 @@ switch() {
 }
 
 # Points .env at the tracked image lines; the running containers are not
-# touched, matomo-update.sh deploys the new images.
+# touched, matomo-update.sh deploys the new images. The complete file is
+# built and validated next to .env and then renamed, so .env is never left
+# with only some lines switched. A failure exits 3 (the new stack runs).
 finalize_env() {
-  local key
+  local key tmp
+  tmp=$(mktemp "$NEW_DIR/.env.final.XXXXXX") || finish_fail "cannot create a temporary .env"
+  {
+    echo "# The image lines are the tracked releases. Until matomo-update.sh has run"
+    echo "# (systemctl start matomo-update.service), the containers may still run the"
+    echo "# images pinned at the migration: a plain \`docker compose up\` would pull"
+    echo "# and recreate them without a backup."
+    cat "$NEW_DIR/.env"
+  } >"$tmp" || finish_fail "cannot write a temporary .env" file "$tmp"
   for key in "${!FINAL_IMAGES[@]}"; do
-    set_env_file_value "$NEW_DIR/.env" "$key" "${FINAL_IMAGES[$key]}" ||
-      fail finalize_failed "cannot update .env" key "$key"
+    set_env_file_value "$tmp" "$key" "${FINAL_IMAGES[$key]}" || finish_fail "cannot update .env" key "$key" file "$tmp"
   done
-  compose_in "$NEW_DIR" config --quiet || fail finalize_failed "final .env is invalid"
+  compose_in "$NEW_DIR" --env-file "$tmp" config --quiet || finish_fail "final .env is invalid" file "$tmp"
+  mv "$tmp" "$NEW_DIR/.env" || finish_fail "cannot replace .env" file "$tmp"
   log info env_finalized "new .env tracks the supported image lines" \
     matomo_image "${FINAL_IMAGES[MATOMO_IMAGE]}" mariadb_image "${FINAL_IMAGES[MARIADB_IMAGE]}"
+}
+
+# finish_fail EVENT_MESSAGE [K V]... - a step after the switch failed; the
+# new stack keeps running.
+finish_fail() {
+  log error finish_failed "$1" "${@:2}"
+  exit 3
 }
 
 install_timer() {

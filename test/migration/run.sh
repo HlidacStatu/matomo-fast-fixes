@@ -5,7 +5,7 @@
 # Starts the old crazymax stack (test/migration/docker-compose.crazymax.yml),
 # creates a marker table and then:
 #   1. --dry-run must change nothing; a migration that cannot be confirmed
-#      must leave no NEW_DIR behind,
+#      must leave no NEW_DIR behind (an existing empty NEW_DIR stays empty),
 #   2. migration to a broken image (healthcheck fails and drops the marker
 #      table) must roll back: old files back, the exact old images running
 #      for all six services, marker table restored from the backup (schema
@@ -144,6 +144,11 @@ status=0
 [[ $status == 1 ]] || fail "unconfirmed migration exited with $status"
 [[ ! -e $WORK/new-unconfirmed ]] || fail "unconfirmed migration left NEW_DIR behind"
 [[ $(stack_images "$OLD") == "$old_images" ]] || fail "unconfirmed migration changed the running stack"
+mkdir "$WORK/new-existing"
+status=0
+"$MIGRATE" --matomo-image "$IMAGE:5" "$OLD" "$WORK/new-existing" </dev/null >&2 || status=$?
+[[ $status == 1 ]] || fail "unconfirmed migration into an existing NEW_DIR exited with $status"
+[[ -d $WORK/new-existing && -z $(ls -A "$WORK/new-existing") ]] || fail "unconfirmed migration left files in an existing NEW_DIR"
 
 echo "--- case 2: failed migration is rolled back"
 status=$(migrate --matomo-image "$IMAGE:broken" "$OLD" "$WORK/new-broken")

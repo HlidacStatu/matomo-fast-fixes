@@ -10,8 +10,12 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=@UPDATE_SCRIPT@ @UPDATE_CONFIG@
-# Must be longer than WAIT_TIMEOUT_SECONDS plus a possible rollback.
+# Must be longer than the backup, WAIT_TIMEOUT_SECONDS and a possible rollback.
 TimeoutStartSec=3h
+# When the start times out (or the unit is stopped) the script gets SIGTERM
+# and rolls back: restoring the dump and waiting for the old stack must fit
+# here (the default 90s would SIGKILL a rollback half way).
+TimeoutStopSec=2h
 Nice=10
 # Backups and logs hold credentials.
 UMask=0077
