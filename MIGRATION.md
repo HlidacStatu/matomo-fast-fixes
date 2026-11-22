@@ -99,7 +99,11 @@ warning in that case.
    images are not pulled here, so tags used by the old compose file do not
    move. The first `matomo-update.sh` run pulls them.
 4. **Asks for confirmation.** Use `--yes` for non-interactive runs. If you
-   decline, or anything fails before the switch, `NEW_DIR` is removed again.
+   decline, or anything fails or is interrupted before the switch, the files
+   the script wrote are removed again: a `NEW_DIR` it created is deleted, an
+   existing empty one is emptied. The run's log then remains only on stdout.
+   A pull error other than "tag not found" (network, rate limit) stops the
+   migration instead of switching to a newer Matomo.
 5. **Takes a backup.** It stops cron, checks free space (at least the size of
    the database), dumps the database and archives `config/` into
    `<web dir>/../backups`.
@@ -114,31 +118,54 @@ warning in that case.
    `core:update`. Then it starts cron, and the downtime ends.
 8. **Updates `.env` and installs the timer.** It points `.env` at the tracked
    image lines and installs the update timer (`server/install-timer.sh`).
-   The timer setup refuses an existing config that points to another stack.
-   Finally it prints where everything is.
+   - The new `.env` is built and validated next to the old one and then
+     renamed, so it never holds only some of the new lines.
+   - The timer setup refuses an existing config that points to another
+     stack; a config of the same stack gets the new values.
+   - Finally it prints where everything is.
+
+   From now on `.env` is ahead of the running containers until the first
+   `matomo-update.sh` run deploys the tracked images. **Do not run a plain
+   `docker compose up -d` in `NEW_DIR` before that**: it would pull and
+   recreate the containers without a backup. Run
+   `systemctl start matomo-update.service` instead (backup, verification,
+   rollback).
 
 **If step 6 or 7 fails, or the script is interrupted (Ctrl+C, SIGTERM, an
-unexpected error), it rolls back automatically.**
+unexpected error), it rolls back automatically.** Further signals are ignored
+while the rollback runs, so it is not cut off half way.
 
 1. It removes the new containers and verifies that none is left.
 2. It moves the files back from `_old_` and re-tags the old images.
-3. It starts the old database and compares its schema fingerprint with the
-   one taken before the switch. **Only if the schema changed**, which means
-   Matomo ran migrations, it restores the dump, discarding data tracked since
-   the backup. Otherwise all data is kept.
+3. It starts the old database and decides whether to restore the dump,
+   discarding data tracked since the backup:
+   - **always** when the switch upgraded Matomo: its migrations may have
+     changed data, or stopped before they changed the schema, which a
+     fingerprint cannot see. Tracking was down during the switch anyway, so
+     little is lost;
+   - with the same Matomo version, only when the schema fingerprint (tables,
+     columns, indexes, recorded schema versions) changed or cannot be read.
+     Otherwise all data is kept.
 4. It replaces `config/` with the archived copy, starts the old stack with
    `--pull never` and checks it over HTTP.
 
 **Downtime** lasts from step 6 to the end of step 7: recreating the containers
 plus Matomo's start. With the same Matomo version this is typically under a
-minute (31 s in the CI test). If the switch also upgrades Matomo, it includes
-the database migrations, which can take much longer on a large database.
+minute: 31 s in the CI test, which uses a Matomo that is not installed yet.
+An installed Matomo also runs `core:update` on start, which adds some time.
+If the switch also upgrades Matomo, it includes the database migrations,
+which can take much longer on a large database.
 
 **Power loss during steps 6–7** is not recovered automatically. In that case:
 - `OLD_DIR/_old_` and `NEW_DIR/migration.log` show how far the migration got.
 - To go back, move the files from `_old_` to `OLD_DIR`, then run
   `docker compose up -d` there.
-- To finish the migration instead, run `docker compose up -d` in `NEW_DIR`.
+- To finish the migration instead, run
+  `docker compose up -d --pull never --wait` in `NEW_DIR`. Its `.env` still
+  pins the old images. Then run `server/install-timer.sh` with the arguments
+  that `migration.log` shows (event `timer_failed` shows the exact command,
+  the plan its values); the first timer run upgrades nothing until you point
+  `.env` at the tracked lines (see `.env.example`).
 
 Exit codes:
 
@@ -147,7 +174,7 @@ Exit codes:
 | `0` | migrated |
 | `1` | failed and rolled back, or nothing was changed |
 | `2` | rollback failed: see `NEW_DIR/migration.log` and the backups |
-| `3` | migrated, but the timer could not be installed |
+| `3` | migrated and the new stack runs, but finishing failed: `.env` could not be pointed at the tracked lines, or the timer could not be installed (see the log) |
 
 Options:
 - `--start-period DURATION` sets `MATOMO_START_PERIOD`, the grace period for

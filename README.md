@@ -86,7 +86,11 @@ needed on the servers.
    moves the old files to `OLD_DIR/_old_`, rolls back automatically on
    failure and installs the timer from step 3. The switch keeps all software
    versions (database untouched); the timer upgrades afterwards. Downtime is
-   typically under a minute.
+   the recreation of the containers plus Matomo's start (31 s in the CI
+   test with a fresh Matomo; longer with a large installed one). After the
+   migration, deploy with `systemctl start matomo-update.service`, not with
+   a plain `docker compose up -d` (that would pull and recreate without a
+   backup).
    Details and the manual procedure are in [MIGRATION.md](MIGRATION.md).
 
 3. **Update script.**
@@ -96,9 +100,9 @@ needed on the servers.
    ```
 
    Arguments: `COMPOSE_DIR BACKUP_DIR HEALTH_URL WAIT_TIMEOUT_SECONDS`. This
-   creates `/etc/matomo-update/matomo-update.env` from the example (an
-   existing file is kept only if it points to the same `COMPOSE_DIR`; adjust
-   the remaining values there), installs the
+   writes `/etc/matomo-update/matomo-update.env` from the example (an
+   existing file must point to the same `COMPOSE_DIR`; it gets the four
+   given values and keeps its other values), installs the
    systemd units with the real path of this checkout and enables the timer.
 
    First run by hand: `systemctl start matomo-update.service && journalctl -u matomo-update -n 50`.
@@ -111,17 +115,26 @@ needed on the servers.
 |---|---|---|
 | no new image | nothing happens (no restart, no backup) | 0 |
 | new image, verification passes | deployed, old backups/images pruned | 0 |
-| new image, verification fails or run interrupted | rolled back to the previous images, config restored, DB restored only if its schema changed, image ID blocked | 1 |
+| new image, verification fails or run interrupted | rolled back to the previous images, config restored, DB restored if the Matomo version or the schema changed, image ID blocked | 1 |
 | rollback fails | log event `rollback_failed`, backups kept for manual restore | 1 |
 | invalid config / missing tools | nothing happens | 2 |
 
 Logs are JSON lines in journald and in `LOG_FILE`, e.g.
 `jq 'select(.level != "info")' /var/log/matomo-update/matomo-update.log`.
 
-A rollback restores the database dump only when the failed update changed
-the schema (Matomo migrations ran; see `server/lib/db.sh`). Only then is the
-tracking data written between the backup and the rollback (typically a few
-minutes) discarded. Before a dump the script checks that the backup
+A rollback restores the database dump when the failed update changed the
+Matomo version (its migrations may have changed data, or stopped before they
+touched the schema) or the schema fingerprint (tables, columns, indexes,
+recorded schema versions; see `server/lib/db.sh`). A rebuild of the same
+Matomo version (security patches) that fails keeps the live data. Only a
+restore discards the tracking data written between the backup and the
+rollback (typically a few minutes, while tracking was down anyway).
+The systemd unit gives a rollback `TimeoutStopSec` to finish when the run
+is stopped or times out, and the script ignores further signals meanwhile.
+MariaDB is tracked on its `major.minor` line, so the timer only applies
+patch releases. Changing that line (e.g. to a newer LTS) is a manual
+maintenance step: a rollback cannot start an older MariaDB on a data
+directory that a newer minor version has upgraded. Before a dump the script checks that the backup
 filesystem has at least as much free space as the database. Containers are
 always started with `up --pull never`, so a rollback is not undone by a pull
 of a `latest` tag. Blocked images are listed in
