@@ -294,6 +294,23 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
+@test "healthcheck_disabled_services lists services with healthcheck.disable" {
+  # Shape of `docker compose config --format json`.
+  json='{"name":"m","services":{
+    "cron":{"image":"x","healthcheck":{"disable":true}},
+    "db":{"image":"y","healthcheck":{"test":["CMD","true"],"interval":"10s"}},
+    "msmtpd":{"image":"z"},
+    "other":{"image":"z","healthcheck":{"disable":false}}}}'
+  run healthcheck_disabled_services <<<"$json"
+  [ "$status" -eq 0 ]
+  [ "$output" = cron ]
+}
+
+@test "containers_running needs at least one container" {
+  run containers_running
+  [ "$status" -ne 0 ]
+}
+
 @test "cleanup_new_dir empties a pre-existing NEW_DIR and removes a created one" {
   NEW_DIR="$BATS_TEST_TMPDIR/existing"
   mkdir "$NEW_DIR"

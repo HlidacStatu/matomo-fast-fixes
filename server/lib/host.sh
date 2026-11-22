@@ -66,3 +66,51 @@ conflicting_shared_images() {
 is_missing_tag_error() {
   grep -qE 'manifest unknown|: not found$' <<<"$1"
 }
+
+# healthcheck_disabled_services - reads `docker compose config --format json`
+# on stdin and prints the services with `healthcheck: disable: true`.
+healthcheck_disabled_services() {
+  jq -r '.services | to_entries[] | select(.value.healthcheck.disable == true) | .key'
+}
+
+# containers_running CONTAINER_ID... - succeeds when at least one container is
+# given and every one is running (not restarting or exited).
+containers_running() {
+  local cid state
+  (($#)) || return 1
+  for cid in "$@"; do
+    state=$(docker inspect --format '{{.State.Status}} {{.State.Restarting}}' "$cid") || return 1
+    [[ $state == "running false" ]] || return 1
+  done
+}
+
+# compose_up_wait COMPOSE_COMMAND TIMEOUT_SECONDS SERVICE...
+# `up -d --pull never --wait` for SERVICEs that have a healthcheck. Services
+# with a disabled healthcheck (the cron sidecar) are started afterwards
+# without --wait and must be running: Docker Compose before v5.0.2 fails
+# `--wait` on them with "container X has no healthcheck configured"
+# (docker/compose#13522) even though there is nothing to wait for.
+# COMPOSE_COMMAND is a command or function that runs `docker compose` for the
+# stack (with its directory, files and environment).
+compose_up_wait() {
+  local compose=$1 timeout=$2 svc disabled
+  shift 2
+  local -a waited=() started=() cids=()
+  disabled=$("$compose" config --format json | healthcheck_disabled_services) || return 1
+  for svc in "$@"; do
+    if grep -qxF -- "$svc" <<<"$disabled"; then
+      started+=("$svc")
+    else
+      waited+=("$svc")
+    fi
+  done
+  if ((${#waited[@]})); then
+    "$compose" up --pull never -d --wait --wait-timeout "$timeout" "${waited[@]}" || return 1
+  fi
+  ((${#started[@]})) || return 0
+  "$compose" up --pull never -d "${started[@]}" || return 1
+  for svc in "${started[@]}"; do
+    mapfile -t cids < <("$compose" ps -q "$svc")
+    containers_running "${cids[@]}" || return 1
+  done
+}

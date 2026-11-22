@@ -22,8 +22,8 @@ Downtime is minimal because:
 
 - everything that can be prepared in advance (files, image pulls, backup)
   is done while the old stack keeps serving,
-- the switch itself is a single `docker compose up -d --wait`, which recreates
-  the containers in place.
+- the switch itself is a `docker compose up -d --wait` (cron is started right
+  after it), which recreates the containers in place.
 
 Tracking requests sent while Matomo is down (tens of seconds) are lost, because
 the JavaScript tracker does not retry. Pick a low-traffic time for step 5.
@@ -163,7 +163,9 @@ which can take much longer on a large database.
   `docker compose up -d --pull never` there (a pull could bring a newer
   image of a moved tag without a backup).
 - To finish the migration instead, run
-  `docker compose up -d --pull never --wait` in `NEW_DIR`. Its `.env` still
+  `docker compose up -d --pull never --wait db redis msmtpd geoip-updater matomo`
+  and then `docker compose up -d --pull never cron` in `NEW_DIR` (see the
+  Compose version note in step 5). Its `.env` still
   pins the old images. Then run `server/install-timer.sh` with the arguments
   that `migration.log` shows (event `timer_failed` shows the exact command,
   the plan its values); the first timer run upgrades nothing until you point
@@ -348,8 +350,15 @@ mv docker-compose.yml docker-compose.crazymax.yml.disabled
 mv .new/compose.yml .new/.env .
 rm -rf .new          # its *.env files are copies of the ones already in /opt/matomo
 
-docker compose up -d --wait --wait-timeout 1800
+docker compose up -d --wait --wait-timeout 1800 db redis msmtpd geoip-updater matomo
+docker compose up -d cron
 ```
+
+cron is started separately because it has no healthcheck
+(`healthcheck: disable: true`): Docker Compose before v5.0.2 fails
+`up --wait` on such a service with `container ... has no healthcheck
+configured` (docker/compose#13522), even though the other containers are up.
+The server scripts do the same (`compose_up_wait` in `server/lib/host.sh`).
 
 `--wait` returns once `db` and `redis` are healthy and `matomo` has finished
 `core:update` (database migrations) and answers its healthcheck. Downtime ends
@@ -401,7 +410,7 @@ the timer.
 
 - **MariaDB LTS.** `10.11` is supported until 2028. Moving to `11.4` or `11.8`
   means changing `MARIADB_IMAGE` in `.env`, taking a backup as in step 3 and
-  running `docker compose up -d --wait`.
+  running the two `docker compose up` commands from step 5.
 - **Cleanup.** After a few days without problems, delete
   `docker-compose.crazymax.yml.disabled` and the `*-pre-migration*` backups.
 

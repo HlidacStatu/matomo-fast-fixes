@@ -1,0 +1,25 @@
+# Minimal stack for test/compose-compat/run.sh: one service with a healthcheck
+# and a sidecar with `healthcheck: disable: true` (like cron in
+# server/compose.yml), plus a sidecar that exits right away.
+name: compose-compat
+services:
+  app:
+    image: ${COMPAT_IMAGE:?}
+    command: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      start_period: 0s
+  sidecar:
+    image: ${COMPAT_IMAGE:?}
+    command: ["sleep", "infinity"]
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+  crashing:
+    image: ${COMPAT_IMAGE:?}
+    command: ["false"]
+    healthcheck:
+      disable: true

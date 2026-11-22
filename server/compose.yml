@@ -2,8 +2,11 @@
 # All values come from .env next to this file (see .env.example); compose
 # fails fast (`:?`) when a required one is missing.
 #
-# Every service has a healthcheck, so `docker compose up --wait` (used by
-# matomo-update.sh) only returns once the stack really works.
+# Every service except the cron sidecar has a healthcheck, so
+# `docker compose up --wait` (used by matomo-update.sh) only returns once the
+# stack really works. cron has `healthcheck: disable: true`; the scripts start
+# it without --wait and check that it runs, because Docker Compose before
+# v5.0.2 rejects --wait on it ("has no healthcheck configured").
 #
 # Images are pulled only by `docker compose pull` (matomo-update.sh); the
 # scripts start containers with `up --pull never`, so a rollback that re-tags

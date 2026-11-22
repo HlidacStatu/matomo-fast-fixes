@@ -351,15 +351,22 @@ read_matomo_config() {
   rm -f "$ini"
 }
 
+# docker compose for the stack (the script runs in COMPOSE_DIR); a command
+# name for compose_up_wait.
+stack_compose() {
+  docker compose "$@"
+}
+
 # Starts all services except cron and waits until they are healthy/running.
 start_services() {
   local -a svcs
   mapfile -t svcs < <(services_without_cron)
-  docker compose up --pull never -d --wait --wait-timeout "$WAIT_TIMEOUT_SECONDS" "${svcs[@]}"
+  compose_up_wait stack_compose "$WAIT_TIMEOUT_SECONDS" "${svcs[@]}"
 }
 
+# The cron sidecar has no healthcheck: compose_up_wait checks that it runs.
 start_cron() {
-  docker compose up --pull never -d --wait --wait-timeout "$WAIT_TIMEOUT_SECONDS" "$CRON_SERVICE"
+  compose_up_wait stack_compose "$WAIT_TIMEOUT_SECONDS" "$CRON_SERVICE"
 }
 
 # Verifies that Matomo answers, runs the expected version and has no pending
@@ -422,7 +429,7 @@ image_version() {
 
 restore_backup() {
   local app_cid app_old_id i old_version new_version same_version=false db_restored=false
-  if ! docker compose up --pull never -d --wait --wait-timeout "$WAIT_TIMEOUT_SECONDS" "$DB_SERVICE"; then
+  if ! compose_up_wait stack_compose "$WAIT_TIMEOUT_SECONDS" "$DB_SERVICE"; then
     log error restore_failed "database service did not start"
     return 1
   fi

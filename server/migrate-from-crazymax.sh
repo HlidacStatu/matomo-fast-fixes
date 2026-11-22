@@ -933,7 +933,9 @@ rollback() {
     log error rollback_failed "config restore failed" config_backup "$CONFIG_BACKUP_FILE"
     exit 2
   fi
-  if ! old_compose up --pull never -d --wait --wait-timeout "$WAIT_TIMEOUT_SECONDS" || ! http_check; then
+  # The old cron sidecar has `healthcheck: disable: true`, which a plain
+  # `up --wait` rejects on Docker Compose before v5.0.2 (compose_up_wait).
+  if ! compose_up_wait old_compose "$WAIT_TIMEOUT_SECONDS" "${SERVICES[@]}" || ! http_check; then
     log error rollback_failed "old stack does not become healthy" compose_file "$OLD_DIR/$OLD_COMPOSE"
     exit 2
   fi
@@ -999,12 +1001,12 @@ switch() {
   fi
   local svcs=()
   mapfile -t svcs < <(printf '%s\n' "${SERVICES[@]}" | grep -vx cron)
-  if ! new_compose up --pull never -d --wait --wait-timeout "$WAIT_TIMEOUT_SECONDS" "${svcs[@]}"; then
+  if ! compose_up_wait new_compose "$WAIT_TIMEOUT_SECONDS" "${svcs[@]}"; then
     log error switch_failed "new stack did not become healthy"
     rollback
   fi
   verify_new_stack || rollback
-  if ! new_compose up --pull never -d --wait --wait-timeout "$WAIT_TIMEOUT_SECONDS" cron; then
+  if ! compose_up_wait new_compose "$WAIT_TIMEOUT_SECONDS" cron; then
     log error switch_failed "new cron sidecar did not start"
     rollback
   fi

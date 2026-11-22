@@ -35,10 +35,28 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
 
       - name: ShellCheck
-        run: shellcheck -x scripts/*.sh scripts/lib/*.sh server/*.sh server/lib/*.sh test/smoke/run.sh test/integration/*.sh test/migration/*.sh
+        run: shellcheck -x scripts/*.sh scripts/lib/*.sh server/*.sh server/lib/*.sh test/smoke/run.sh test/integration/*.sh test/migration/*.sh test/compose-compat/*.sh
 
       - name: Unit tests
         run: bats test/unit
+
+  compose-compat:
+    needs: lint-test
+    runs-on: ubuntu-latest
+    env:
+      # Docker Compose v2.39 (before v5.0.2 rejects `up --wait` on a disabled
+      # healthcheck, docker/compose#13522), as still found on servers.
+      COMPAT_CLI_IMAGE: docker:28.3.2-cli
+      COMPAT_SERVICE_IMAGE: alpine:3.22
+      COMPAT_TIMEOUT_SECONDS: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: compose_up_wait with an older Docker Compose
+        run: test/compose-compat/run.sh "$COMPAT_CLI_IMAGE" "$COMPAT_SERVICE_IMAGE" "$COMPAT_TIMEOUT_SECONDS"
 
   integration:
     needs: lint-test
@@ -117,7 +135,7 @@ jobs:
         run: sudo test/migration/run.sh matomo:candidate
 
   build:
-    needs: [lint-test, integration, migration]
+    needs: [lint-test, compose-compat, integration, migration]
     permissions:
       contents: read
       packages: write
