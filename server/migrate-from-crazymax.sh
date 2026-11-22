@@ -631,18 +631,6 @@ select_matomo_image() {
     image "$tracked" from "$OLD_MATOMO_VERSION" to "$label"
 }
 
-# The tracked images are only checked for existence (nothing is pulled, so
-# tags used by the old compose file do not move).
-check_tracked_images() {
-  local key
-  for key in "${!FINAL_IMAGES[@]}"; do
-    if ! docker manifest inspect "${FINAL_IMAGES[$key]}" >/dev/null 2>&1; then
-      log warn tracked_image_unavailable "image the stack tracks after the migration cannot be resolved now" \
-        key "$key" image "${FINAL_IMAGES[$key]}"
-    fi
-  done
-}
-
 # Writes compose.yml, .env and the env files into DIR.
 generate_config() {
   local dir=$1 key
@@ -1023,7 +1011,6 @@ main() {
   inspect_old_stack
   fill_defaults_from_example
   select_matomo_image
-  check_tracked_images
 
   if $DRY_RUN; then
     DRY_RUN_DIR=$(mktemp -d)

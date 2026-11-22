@@ -93,3 +93,13 @@ setup() {
   app_changed
   app_or_db_changed
 }
+
+@test "clean_compose_environment keeps the script's own configuration" {
+  cd "$BATS_TEST_TMPDIR"
+  printf "MATOMO_IMAGE='x'\n" >.env
+  export COMPOSE_DIR=/opt/m COMPOSE_FILE=/bogus.yml MATOMO_IMAGE=bogus
+  clean_compose_environment
+  [ "$COMPOSE_DIR" = /opt/m ]
+  [ -z "${COMPOSE_FILE:-}" ]
+  [ -z "${MATOMO_IMAGE:-}" ]
+}

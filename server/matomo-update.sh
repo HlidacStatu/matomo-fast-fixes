@@ -476,11 +476,12 @@ cleanup() {
 }
 
 # Shell variables take precedence over .env during compose interpolation;
-# remove every COMPOSE_* variable and every key the stack's .env defines.
+# remove every COMPOSE_* variable and every key the stack's .env defines
+# (except this script's own configuration, e.g. COMPOSE_DIR).
 clean_compose_environment() {
   local var
   while IFS= read -r var; do
-    unset "$var"
+    [[ " ${REQUIRED_CONFIG[*]} " == *" $var "* ]] || unset "$var"
   done < <({ compgen -e | grep -E '^COMPOSE_'; [[ ! -f .env ]] || grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' .env | tr -d =; } || true)
 }
 

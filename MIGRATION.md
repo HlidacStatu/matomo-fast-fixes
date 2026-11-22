@@ -96,8 +96,8 @@ warning in that case.
    - `COMPOSE_*` variables and `.env` keys exported in your shell are ignored.
    - The resolved compose model is checked against the plan.
 3. **Pulls the Matomo image for the switch** and shows the plan. Tracked
-   images are only looked up, not pulled, so tags used by the old compose
-   file do not move.
+   images are not pulled here, so tags used by the old compose file do not
+   move. The first `matomo-update.sh` run pulls them.
 4. **Asks for confirmation.** Use `--yes` for non-interactive runs. If you
    decline, or anything fails before the switch, `NEW_DIR` is removed again.
 5. **Takes a backup.** It stops cron, checks free space (at least the size of
