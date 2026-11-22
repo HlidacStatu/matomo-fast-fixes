@@ -80,28 +80,22 @@ needed on the servers.
    chmod 600 .env msmtpd.env geoip-updater.env
    ```
 
-   Migrating a running crazymax stack: follow [MIGRATION.md](MIGRATION.md)
-   (step-by-step, no data loss, about a minute of downtime). In short:
-   - keep `MATOMO_DATA_DIR=/data/matomo` - the bind mount layout is the same,
-   - set `COMPOSE_PROJECT_NAME` to the old project name (the old directory
-     name) or run `docker compose down` in the old directory first,
-   - `MYSQL_*` must match the existing database user,
-   - `mariadb:10.11` is what `mariadb:10` resolved to, so the data directory
-     is reused as is. Root password settings only apply to a new data
-     directory; an existing passwordless root stays passwordless - set a
-     password manually (`ALTER USER 'root'@'%' IDENTIFIED BY ...`),
-   - `redis:4.0` is replaced by `redis:8-alpine`; Redis holds only cache data.
+   **Migrating a running crazymax stack:** do not do this by hand, run
+   `server/migrate-from-crazymax.sh OLD_DIR NEW_DIR` instead. It generates
+   this configuration from the running containers, keeps the data in place,
+   moves the old files to `OLD_DIR/_old_`, rolls back automatically on
+   failure and installs the timer from step 3. Downtime is about a minute.
+   Details and the manual procedure are in [MIGRATION.md](MIGRATION.md).
 
 3. **Update script.**
 
    ```sh
-   install -d -m 700 /etc/matomo-update
-   install -m 600 /opt/matomo-fast-fixes/server/matomo-update.env.example /etc/matomo-update/matomo-update.env
-   # adjust COMPOSE_DIR, BACKUP_DIR, HEALTH_URL, ...
-   cp /opt/matomo-fast-fixes/server/systemd/matomo-update.* /etc/systemd/system/
-   systemctl daemon-reload
-   systemctl enable --now matomo-update.timer
+   /opt/matomo-fast-fixes/server/install-timer.sh /opt/matomo /data/matomo/backups http://127.0.0.1:8000/
    ```
+
+   This creates `/etc/matomo-update/matomo-update.env` from the example (an
+   existing file is kept; adjust the remaining values there), installs the
+   systemd units with the real path of this checkout and enables the timer.
 
    First run by hand: `systemctl start matomo-update.service && journalctl -u matomo-update -n 50`.
 
@@ -147,4 +141,7 @@ restore the matching backup from `BACKUP_DIR` if the DB was migrated, then
 - `bats test/unit` - unit tests of the scripts,
 - `test/smoke/run.sh IMAGE VERSION TIMEOUT` - smoke test of an image,
 - `test/integration/run.sh IMAGE` - full update, rollback and block cycle of
-  `matomo-update.sh` against a local registry (needs Docker; runs in CI).
+  `matomo-update.sh` against a local registry (needs Docker; runs in CI),
+- `sudo test/migration/run.sh IMAGE` - migration of a real crazymax stack:
+  dry run, automatic rollback, successful migration, timer installation and
+  first update run (needs Docker and systemd; runs in CI).

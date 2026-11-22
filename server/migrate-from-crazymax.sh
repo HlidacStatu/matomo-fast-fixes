@@ -67,6 +67,8 @@ OLD_SUBDIR=_old_
 # compose.yml uses the healthcheck option start_interval (Docker Engine 25).
 MIN_DOCKER_MAJOR=25
 VERSION_LABEL=org.opencontainers.image.version
+# Timezone the crazymax entrypoint uses when TZ is unset.
+CRAZYMAX_TZ_FALLBACK=UTC
 # Environment set by compose.yml itself, therefore not copied into env files.
 CRON_ONLY_KEYS=(TZ SIDECAR_CRON CRON_ARCHIVE ARCHIVE_OPTIONS)
 REQUIRED_COMMANDS=(docker jq curl gzip tar realpath)
@@ -354,7 +356,12 @@ inspect_old_stack() {
   app_env=$(container_env "${OLD_CID[matomo]}")
   cron_env=$(container_env "${OLD_CID[cron]}")
   ENV_VALUES[TZ]=$(jq -r '.TZ // empty' <<<"$app_env")
-  [[ -n ${ENV_VALUES[TZ]} ]] || fail old_stack_invalid "cannot determine TZ of the matomo container"
+  if [[ -z ${ENV_VALUES[TZ]} ]]; then
+    # Unset TZ means the crazymax entrypoint ran with its own fallback
+    # (`TZ=${TZ:-UTC}` in /etc/s6-overlay/scripts/config); keep that behaviour.
+    ENV_VALUES[TZ]=$CRAZYMAX_TZ_FALLBACK
+    log warn tz_fallback "TZ was not set in the old stack, keeping the crazymax fallback" tz "$CRAZYMAX_TZ_FALLBACK"
+  fi
   ENV_VALUES[CRON_ARCHIVE]=$(jq -r '.CRON_ARCHIVE // empty' <<<"$cron_env")
   ENV_VALUES[ARCHIVE_OPTIONS]=$(jq -r '.ARCHIVE_OPTIONS // empty' <<<"$cron_env")
   [[ -n ${ENV_VALUES[CRON_ARCHIVE]} ]] || fail old_stack_invalid "cron has no CRON_ARCHIVE schedule"

@@ -30,6 +30,83 @@ the JavaScript tracker does not retry. Pick a low-traffic time for step 5.
 Commands assume the old stack lives in `/opt/matomo` and runs as root. Replace
 the paths if yours differ.
 
+## Automated migration (recommended)
+
+`server/migrate-from-crazymax.sh` performs the steps below in one run and
+rolls back automatically if the new stack does not come up.
+
+```sh
+git clone https://github.com/HlidacStatu/matomo-fast-fixes /opt/matomo-fast-fixes
+cd /opt/matomo-fast-fixes/server
+
+# 1. Checks only, shows the generated configuration, changes nothing:
+./migrate-from-crazymax.sh --dry-run /opt/matomo /opt/matomo-hs
+
+# 2. The migration itself (asks before the switch):
+./migrate-from-crazymax.sh /opt/matomo /opt/matomo-hs
+```
+
+Arguments:
+- `OLD_DIR` (`/opt/matomo`) is the directory with the running stack's
+  `docker-compose.yml` and env files.
+- `NEW_DIR` (`/opt/matomo-hs`) is an empty or missing directory for the new
+  `compose.yml` and `.env`.
+
+### What the script does
+
+1. **Checks** the following and stops with a clear message if something does
+   not hold:
+   - Docker Engine 25 or newer,
+   - all six services are running,
+   - every data directory is a bind mount,
+   - `config.ini.php` uses the `db` service's credentials (pre-flight check
+     below),
+   - the Matomo major version matches.
+2. **Generates `NEW_DIR`** from the *running* containers. It reads their
+   environment (minus image defaults), bind mounts and published port, so
+   values from `environment:`, `env_file:` and shell variables are all carried
+   over exactly.
+   - MariaDB stays on the release line it runs now (e.g. `mariadb:10.11`), so
+     the data directory is not upgraded by the migration.
+   - The project name stays the same.
+3. **Pulls the new images** and shows the plan.
+4. **Asks for confirmation.** Use `--yes` for non-interactive runs.
+5. **Takes a backup.** It stops cron, then dumps the database (the check
+   requires `-- Dump completed` and at least one table) and archives `config/`
+   into `<web dir>/../backups`.
+6. **Switches over (the downtime).** It moves every file of `OLD_DIR` except
+   data directories into `OLD_DIR/_old_` and runs
+   `docker compose up -d --wait` in `NEW_DIR`, which recreates the containers
+   in place.
+7. **Verifies the new stack:** HTTP, Matomo version and `core:update`.
+8. **Installs the update timer** (`server/install-timer.sh`) and prints where
+   everything is.
+
+**If step 6 or 7 fails, it rolls back automatically.** The new containers are
+removed and the files are moved back from `_old_`. The database and `config/`
+are restored from the backup, and the old stack is started again. Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | migrated |
+| `1` | failed and rolled back, or nothing was changed |
+| `2` | rollback failed: see `NEW_DIR/migration.log` and the backups |
+| `3` | migrated, but the timer could not be installed |
+
+Options:
+- `--start-period DURATION` sets `MATOMO_START_PERIOD`, the grace period for
+  DB migrations. Raise it for very large databases.
+- `--wait-timeout SECONDS` sets how long the switch may wait for a healthy
+  stack.
+- `--matomo-image IMAGE` pins a specific image.
+
+Still check the database credentials (step 0) before the first run. The script
+refuses to continue on a mismatch, but fixing it is up to you. Afterwards do
+the follow-up hardening (step 8).
+
+The rest of this document is the same procedure done by hand, for when you
+want to run or inspect each step yourself.
+
 ---
 
 ## 0. Pre-flight checks (no downtime)
@@ -111,7 +188,8 @@ Edit `.env`:
 | Key | Value |
 |---|---|
 | `COMPOSE_PROJECT_NAME` | the `NAME` from step 0 (e.g. `matomo`) |
-| `MATOMO_DATA_DIR` | `/data/matomo` (the old bind mount root) |
+| `MATOMO_DB_DIR`, `MATOMO_WEB_DIR`, `MATOMO_GEOIP_DIR` | the old bind mount sources (`/data/matomo/db`, `/data/matomo/web`, `/data/matomo/geoip-updater`) |
+| `MARIADB_IMAGE` | `mariadb:<major.minor>` of the running server (`SELECT VERSION()`), so the data directory is not upgraded during the migration |
 | `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD` | exactly the values from the old `docker-compose.yml` |
 | `TZ` | your timezone, e.g. `Europe/Prague` (the old file passed an empty `TZ` from the shell) |
 | `CRON_ARCHIVE`, `ARCHIVE_OPTIONS` | the values from the old `cron` service |
@@ -213,15 +291,14 @@ Then check in the Matomo UI:
 ## 7. Enable automatic updates
 
 ```sh
-install -d -m 700 /etc/matomo-update
-install -m 600 /opt/matomo-fast-fixes/server/matomo-update.env.example /etc/matomo-update/matomo-update.env
-# COMPOSE_DIR=/opt/matomo, BACKUP_DIR=/data/matomo/backups, HEALTH_URL=http://127.0.0.1:8000/
-cp /opt/matomo-fast-fixes/server/systemd/matomo-update.* /etc/systemd/system/
-systemctl daemon-reload
+/opt/matomo-fast-fixes/server/install-timer.sh /opt/matomo /data/matomo/backups http://127.0.0.1:8000/
 systemctl start matomo-update.service      # first run by hand
 journalctl -u matomo-update -n 20          # expect event "no_update"
-systemctl enable --now matomo-update.timer
 ```
+
+`install-timer.sh` creates `/etc/matomo-update/matomo-update.env` (an existing
+one is kept), installs the systemd units with the real script path and enables
+the timer.
 
 ## 8. Follow-up hardening (separate maintenance windows)
 
