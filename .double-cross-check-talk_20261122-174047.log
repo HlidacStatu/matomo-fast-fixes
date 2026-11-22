@@ -1,0 +1,927 @@
+SKILL=double-cross-check
+Verifiers: Codex (gpt-6-astra, high), Grok (grok-4.7, high)
+Subject: server/migrate-from-crazymax.sh and related server scripts
+
+--- Iteration 1: Prompt ---
+Posuď následující zadání kriticky. Nehledej potvrzení, hledej chyby.
+
+Zaměř se na:
+- chybné nebo slabé předpoklady,
+- bezpečnostní a provozní rizika (ztráta dat, delší výpadek, nefunkční rollback),
+- opomenuté alternativy,
+- nesoulad s běžnou praxí,
+- tvrzení, která potřebují primární zdroj nebo test.
+
+U každého nálezu uveď:
+- závažnost (blocker / major / minor / nit),
+- konkrétní lokaci (soubor:řádek) a důvod,
+- konkrétní scénář, kdy chyba nastane,
+- jak nález ověřit,
+- doporučenou opravu.
+
+Zadání:
+Review migračního skriptu `server/migrate-from-crazymax.sh OLD_DIR NEW_DIR` v tomto repozitáři (pracovní adresář). Skript převádí běžící produkční Matomo stack postavený z crazymax/docker-matomo compose souboru (služby db=MariaDB, redis, msmtpd, geoip-updater, matomo, cron; data v bind mountech) na compose z tohoto repa (`server/compose.yml`, obraz ghcr.io/hlidacstatu/matomo, stejný runtime jako crazymax).
+
+Požadavky zadavatele:
+1. žádná ztráta dat, minimální výpadek,
+2. data zůstávají na místě; původní soubory z OLD_DIR mimo data se přesunou do OLD_DIR/_old_,
+3. při selhání automatický rollback,
+4. na konci nainstalovat systemd timer pro server/matomo-update.sh a vypsat to uživateli.
+
+Klíčová rozhodnutí v implementaci:
+- konfigurace (.env, matomo.env, msmtpd.env, geoip-updater.env) se generuje z BĚŽÍCÍCH kontejnerů (docker inspect: Config.Env minus ENV obrazu, Mounts, porty z `docker compose config --format json`), hodnoty se zapisují v jednoduchých uvozovkách,
+- MariaDB obraz se pinne na major.minor běžícího serveru (SELECT VERSION()), aby se datadir migrací neměnil,
+- nový projekt má stejný COMPOSE_PROJECT_NAME jako starý, kontejnery se nahradí přes `docker compose up -d --wait` v NEW_DIR (žádné `down` starého stacku předem),
+- záloha (mariadb-dump --single-transaction --add-drop-database + tar config/) se dělá po potvrzení a po zastavení cronu, těsně před přepnutím,
+- rollback: `docker compose down` nového projektu, vrácení souborů z _old_, start staré db, obnova dumpu a config/, `up -d --wait` starého stacku.
+
+Soubory k posouzení (přečti je):
+- server/migrate-from-crazymax.sh (hlavní)
+- server/install-timer.sh, server/lib/log.sh, server/systemd/matomo-update.service, server/systemd/matomo-update.timer
+- server/compose.yml, server/.env.example, server/matomo-update.env.example
+- server/matomo-update.sh (běží potom z timeru)
+- test/migration/run.sh, test/migration/docker-compose.crazymax.yml, test/unit/migrate.bats
+- MIGRATION.md (sekce Automated migration)
+
+Ověřené fakty (CI na ubuntu-latest, Docker 2x.x, compose v2): integrační test test/migration/run.sh prošel – dry-run nic nezměnil; migrace na rozbitý obraz se vrátila (soubory zpět, staré kontejnery běží, smazaná kontrolní tabulka obnovena z dumpu, timer nenainstalován); úspěšná migrace s výpadkem 31 s, timer nainstalován, první běh matomo-update.sh vrátil no_update. Test běžel proti NEINSTALOVANÉMU Matomu (bez config.ini.php [database]), takže cesta s reálnou instalací a migrací DB (core:update) testem pokryta není.
+
+Nepiš do souborů, jen čti a odpověz. Odpověz česky, seřazeno od nejzávažnějšího.
+
+--- Iteration 1: Codex ---
+**V současné podobě bych skript pro produkční migraci s požadavkem „žádná ztráta dat“ neschválil.** Nejzávažnější problém je přímo v návrhu rollbacku: obnovuje starší snapshot, zatímco aplikace mezitím přijímá další zápisy.
+
+Přečetl jsem všechny uvedené soubory i související inicializaci obrazu. Výsledek CI nezpochybňuji; nepokrývá však níže uvedené produkční scénáře. Nic jsem neupravoval.
+
+1. **blocker — Rollback zahazuje již přijatá data.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:619–625, 600–602`. Před dumpem se zastaví pouze cron. Web dál zapisuje. Obnova dumpu s `--add-drop-database` odstraní všechny následné zápisy. Stejnou chybu má `server/matomo-update.sh:421, 342`; řádek 378 ztrátu dokonce explicitně oznamuje. Dokumentace ji připouští v `MIGRATION.md:353`, což odporuje zadání.
+
+   **Scénář:** dump trvá dvacet minut, mezitím přicházejí návštěvy a změny administrace. Přepnutí selže. Rollback obnoví stav ze začátku dumpu, nikoli bezprostředně před přepnutím. Ztrátové okno tedy není pouze deklarovaných 31 sekund.
+
+   **Ověření:** během dumpu a přepnutí posílat očíslované tracking požadavky, vynutit rollback a porovnat potvrzené požadavky s obnovenou databází.
+
+   **Oprava:** před konzistentním bodem zálohy zastavit všechny zapisující procesy, dokončit rozpracované požadavky a další tracking spolehlivě ukládat do fronty mimo migrovaný stack. Alternativou je předem otestovaná obnova změn z binlogu; samotný snapshot nestačí.
+
+2. **major — Rollback nezaručuje návrat k původním obrazům ani efektivní konfiguraci.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:456, 591–610`. Skript obnoví staré soubory a spustí jejich tagy, ale nezafixuje obrazové ID běžících kontejnerů. `pull` přitom může změnit lokální význam společných tagů, například `crazymax/msmtpd:latest`, `crazymax/geoip-updater:latest` nebo `mariadb:10.11`. Staré soubory také nemusí odpovídat prostředí, se kterým byly kontejnery původně vytvořeny.
+
+   **Scénář:** běží starší SMTP obraz, migrace stáhne novější pod stejným tagem. Po selhání rollback spustí právě nový obraz. Obdobně selže obnova konfigurace, jejíž hodnoty pocházely z dnes nedostupných shell proměnných.
+
+   **Ověření:** před migrací zaznamenat `.Image` a efektivní konfiguraci všech šesti služeb; po vynuceném rollbacku porovnat všechny služby, nikoli pouze Matomo jako v `test/migration/run.sh:133`.
+
+   **Oprava:** před prvním pullem uložit neměnný rollback manifest s přesnými image ID/digesty a vyhodnocenou konfigurací. Při obnově zakázat pull a používat tento manifest.
+
+3. **major — Pin MariaDB na `major.minor` nezaručuje nezměněný datadir.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:398`, `server/compose.yml:28`, `MIGRATION.md:69–70`. `mariadb:10.11` je pohyblivý tag, nikoli původní server. Navíc se zapíná `MARIADB_AUTO_UPGRADE=1`. Oficiální entrypoint může například doplnit healthcheck uživatele i při zachování stejné release řady. Tvrzení „datadir se migrací nemění“ tedy neplatí. [Zdrojový kód MariaDB entrypointu](https://raw.githubusercontent.com/MariaDB/mariadb-docker/master/docker-entrypoint.sh).
+
+   **Scénář:** dlouho běžící instalace dostane novější patch a jiný entrypoint. Při problému skript potřebuje nejprve spustit starou DB nad již změněným datadirem, teprve potom importuje dump. Dump samotné Matomo databáze není zálohou systémové databáze ani fyzického stavu serveru.
+
+   **Ověření:** migrovat konkrétní starší patch, porovnat image ID, verzi, systémové tabulky a soubory datadiru; následně provést skutečný návrat.
+
+   **Oprava:** při změně distribuce Matoma ponechat přesný původní DB obraz. Aktualizaci MariaDB oddělit a připravit pro ni samostatně ověřenou obnovu.
+
+4. **major — Automatický rollback nepokrývá přerušení procesu a neošetřené chyby.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:619–641, 681`; jediný trap uklízí dry-run adresář. Rollback se volá pouze z několika explicitních větví. `server/matomo-update.sh:427–434` má stejnou slabinu.
+
+   **Scénář:** `SIGTERM`, ztráta SSH relace nebo chyba zápisu logu po zastavení cronu ukončí skript bez obnovy. Aktualizátor může obdobně ukončit `TimeoutStartSec=3h` v `server/systemd/matomo-update.service:14`. Po pádu stroje chybí stav umožňující bezpečné pokračování.
+
+   **Ověření:** v izolované instalaci přerušovat proces po zastavení cronu, přesunu souborů a během přepnutí; zvlášť simulovat neúspěšný zápis logu.
+
+   **Oprava:** zavést explicitní fáze migrace, obsluhu zachytitelných signálů/chyb a trvalý záznam stavu. Obnova musí být opakovatelná a rozlišovat „jen znovu spustit cron“ od „obnovit databázi“. Pro výpadek napájení nestačí samotný trap.
+
+5. **major — Obnova databáze pokračuje i po neúspěšném zastavení nového stacku.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:590`. Selhání `new_compose down --remove-orphans` je pouze varování; následuje spuštění DB a destruktivní import.
+
+   **Scénář:** `down` odstraní jen část kontejnerů a skončí chybou. Nové Matomo nebo cron stále zapisují, zatímco rollback provádí `DROP DATABASE` a import. Výsledkem může být poškozená logická konzistence nebo další selhání obnovy.
+
+   **Ověření:** vyvolat částečné selhání odstraňování kontejnerů a ověřit, zda skript před importem skutečně kontroluje zastavení všech zapisujících procesů.
+
+   **Oprava:** před obnovou explicitně ověřit jejich zastavení. Při neúspěchu nepokračovat v destruktivním importu; opakovat bezpečné zastavení nebo skončit s přesnou diagnostikou.
+
+6. **major — Shell prostředí může přepsat vygenerovanou konfiguraci.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:123–125, 451, 456`. Compose se spouští se zděděným prostředím. Hodnoty shellu mají přednost před `.env`; jednoduché uvozovky tuto prioritu nemění. [Dokumentace Docker Compose](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/).
+
+   **Scénář:** administrátor má exportované `MATOMO_DB_DIR`, `MARIADB_IMAGE` nebo `COMPOSE_FILE`. Skript vypíše plán podle `ENV_VALUES`, ale Compose použije jiný datadir, obraz či soubor. Výsledek interaktivní migrace se navíc může lišit od následného běhu pod systemd.
+
+   **Ověření:** v testu exportovat kolidující proměnné a porovnat plán se skutečným `docker compose config --format json`.
+
+   **Oprava:** Compose spouštět s kontrolovaným prostředím, explicitním souborem a projektem. Před přepnutím ověřit vyhodnocený model proti očekávaným mountům, obrazům, portům a názvu projektu. Samotné `--env-file` prioritu shellu neodstraní.
+
+7. **major — Zálohy mohou být čitelné ostatním lokálním uživatelům.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:508–527`, `server/matomo-update.sh:249, 265, 400`. Chybí privátní umask i nastavení práv záloh. Při `umask 022` vznikají typicky soubory `0644` a adresáře `0755`. Systémové služby systemd standardně používají právě `0022`. [Dokumentace systemd](https://www.freedesktop.org/software/systemd/man/254/systemd.exec.html#UMask=).
+
+   **Scénář:** jiný lokální účet při průchozích nadřazených adresářích přečte SQL dump a archiv konfigurace obsahující hesla a další citlivé údaje.
+
+   **Ověření:** spustit test s `umask 022`, zkontrolovat práva a zkusit čtení jiným UID.
+
+   **Oprava:** nastavit `umask 077` před vytvářením souborů, zajistit privátní zálohovací adresář a přidat `UMask=0077` do služby. Prověřit také již existující zálohy.
+
+8. **major — Kontrola nepodporovaných nastavení je neúplná; část runtime konfigurace se tiše zahodí.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:300–382`, `server/compose.yml:14–17`. Kontrolují se některé mounty a prostředí, ale nikoli například skutečné argumenty DB, vlastní entrypoint, sítě nebo bezpečnostní nastavení. Odečítání původních image ENV navíc zachovává chování pouze tehdy, když mají nové obrazy stejné výchozí hodnoty.
+
+   **Scénář:** původní DB byla inicializována s vlastním `--innodb-page-size` nebo `--lower-case-table-names`; nový compose tento argument zahodí. Jde o nastavení vázaná na inicializaci databáze. [Dokumentace MariaDB](https://mariadb.com/docs/server/reference/sql-structure/sql-language-structure/identifier-case-sensitivity).
+
+   **Ověření:** doplnit varianty původního stacku s odlišnými argumenty DB a rozdílnými image defaults; porovnat skutečný stav před a po migraci.
+
+   **Oprava:** definovat podporovaný profil a všechny nepřenášené odchylky odmítat před přepnutím. U relevantních ENV porovnat také nové defaults. Porty ověřovat proti běžícímu kontejneru, nikoli pouze proti aktuálnímu souboru.
+
+9. **major — Redis nelze bez ověření považovat za zahoditelnou cache.**
+
+   **Lokace a důvod:** `server/.env.example:24–25`, `server/migrate-from-crazymax.sh:325–328, 423`. Migrace mění Redis na řadu 8, nekontroluje jeho mounty a nezálohuje jeho stav. Komentář slučující „cache/queue“ je chybný: fronta může obsahovat dosud nezpracované návštěvy. Matomo tento způsob používání Redis podporuje. [QueuedTracking](https://github.com/matomo-org/plugin-QueuedTracking).
+
+   **Scénář:** produkce používá QueuedTracking a Redis obsahuje nevyřízené požadavky. Restart, ztráta neperzistentního stavu nebo odpojení původního úložiště při rollbacku je odstraní, i když SQL databáze zůstane zachována.
+
+   **Ověření:** připravit neprázdnou frontu, otestovat úspěch i rollback a porovnat všechny přijaté a zpracované požadavky.
+
+   **Oprava:** zjistit skutečné využití Redis. Frontu před přepnutím bezpečně vyprázdnit nebo zachovat a ověřit její persistenci. Upgrade Redis oddělit od migrace Matoma.
+
+10. **major — Platnost dumpu není dostatečně ověřena pro všechny přijímané instalace.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:515–527`. Kontrola posledního komentáře a nenulového počtu tabulek neprokazuje konzistenci ani obnovitelnost. `--single-transaction` zaručuje konzistentní snapshot pro InnoDB, nikoli obecně pro ostatní enginy; souběžné DDL je další omezení. [Dokumentace mariadb-dump](https://mariadb.com/docs/server/clients-and-utilities/backup-restore-and-import-clients/mariadb-dump#--single-transaction).
+
+   **Scénář:** starší instalace nebo plugin používá netransakční tabulky, případně během dumpu proběhne změna schématu. Dump může být nevhodný pro konzistentní obnovu. Vlastní routines/events navíc příkaz nezahrnuje.
+
+   **Ověření:** před migrací inventarizovat enginy a databázové objekty; zálohu obnovit do izolované instance a provést aplikační kontroly.
+
+   **Oprava:** nepodporované konfigurace odmítat nebo použít odpovídající zamykání/zálohovací postup. Obnovitelnost ověřovat prakticky, nejen podle textového zakončení souboru.
+
+11. **major — „Healthy“ není spolehlivá bariéra dokončené migrace DB.**
+
+   **Lokace a důvod:** `rootfs/etc/s6-overlay/scripts/config-main:17–18`, `rootfs/usr/local/bin/healthcheck:7`, `server/compose.yml:99–103`, `server/migrate-from-crazymax.sh:634–638`. Inicializační skript nemá `set -e` ani explicitní kontrolu výsledku `core:update`. Pokud následující `config:set` uspěje, chyba aktualizace se může ztratit. Healthcheck ověřuje PHP-FPM ping. Cron se spustí před dodatečným `verify_new_stack`.
+
+   **Scénář:** aktualizace schématu částečně selže, procesy se přesto rozběhnou a cron začne pracovat nad neúplným schématem. Dodatečný `core:update` pak představuje další pokus o změnu DB, nikoli čistou kontrolu. Naopak rollback v řádku 610 ověřuje pouze `up --wait`; původní služby bez healthchecku mohou být jen „running“.
+
+   **Ověření:** instalované Matomo se skutečnou změnou schématu, deterministickou chybou migrace a kontrolou okamžiku spuštění cronu. Současný `test/migration/run.sh:115` vytváří pouze marker a tuto cestu neprověřuje.
+
+   **Oprava:** při chybě `core:update` zastavit inicializaci, cron spustit až po úspěšném ověření a ověřovat funkčnost aplikace také po rollbacku.
+
+12. **major — Timer může úspěšně zůstat nastavený na jiný stack.**
+
+   **Lokace a důvod:** `server/install-timer.sh:37–38, 54`, `server/migrate-from-crazymax.sh:650`. Existující konfigurace se bez porovnání zachová. Instalace přesto hlásí úspěch.
+
+   **Scénář:** `/etc/matomo-update/matomo-update.env` odkazuje na předchozí `OLD_DIR` nebo jinou instalaci. Nový stack se neaktualizuje, případně timer zasahuje do jiného stacku. Také migrační `--wait-timeout` se do konfigurace aktualizátoru nepřenáší.
+
+   **Ověření:** integrační test s předexistující konfigurací a odlišnými cestami, portem a timeoutem; ověřit efektivní nastavení služby.
+
+   **Oprava:** konfiguraci porovnat s požadovaným cílem a nesoulad explicitně řešit. Pro více stacků použít instancované jednotky. Úspěch hlásit až po validaci vazby timeru na migrovaný projekt.
+
+13. **major — Platné cesty mohou vytvořit nefunkční konfiguraci timeru.**
+
+   **Lokace a důvod:** `server/install-timer.sh:40–50`, `server/systemd/matomo-update.service:12`, `server/matomo-update.sh:70`. Hodnoty se zapisují nequotované do souboru, který se následně načítá pomocí `source`; zároveň nejsou escapované pro náhradu v `sed`. Nequotované je i `ExecStart`.
+
+   **Scénář:** `NEW_DIR=/opt/Matomo Stack` vytvoří `COMPOSE_DIR=/opt/Matomo Stack`, což shell interpretuje jako spuštění příkazu `Stack`. Znak `&` poškodí náhradu v `sed`; mezera v cestě checkoutu rozbije příkaz služby.
+
+   **Ověření:** případ s mezerou jsem reprodukoval bez zápisu do souborů: skončil `Stack: command not found`. Doplnit integrační test těchto cest.
+
+   **Oprava:** shell konfiguraci generovat bezpečným quotingem, například Bash `printf %q`; systemd argumenty escapovat podle syntaxe systemd. Jednotku i konfiguraci před aktivací validovat.
+
+14. **minor — Dry-run mění Docker image store a lokální tagy.**
+
+   **Lokace a důvod:** `server/migrate-from-crazymax.sh:679–686` volá `check_new_images`, které na řádku 456 provádí `docker compose pull`. Výrok „nothing was changed“ je širší než skutečné chování.
+
+   **Scénář:** dry-run stáhne nové obrazy a posune společné tagy. Běžící kontejnery zůstanou stejné, ale pozdější `compose up` může použít jiný obraz. Test v `test/migration/run.sh:124–126` toto nekontroluje.
+
+   **Ověření:** porovnat image ID jednotlivých tagů před a po dry-runu.
+
+   **Oprava:** oddělit kontrolu od přípravy obrazů, případně přejmenovat režim a přesně popsat jeho změny.
+
+Pro první produkční přechod bych zvolil menší rozsah: ponechat přesné obrazy MariaDB, Redis a pomocných služeb, změnit pouze distribuci Matoma a samostatně otestovat upgrade aplikace. Podmínkou nasazení by byl test **instalovaného Matoma se souběžným trackingem, reálnou změnou schématu a vynuceným rollbackem**. Dosavadních 31 sekund nelze použít jako odhad takového scénáře.
+
+Lokálně prošla kontrola shellové syntaxe. Integrační testy jsem znovu nespouštěl, protože mění soubory, kontejnery a systemd; ostatní návrhy ověření výše označují dosud neprovedené testy.
+--- Iteration 1: Grok ---
+Prohlédnu migrační skript a související soubory a budu hledat slabé předpoklady, rizika ztráty dat a díry v rollbacku. Nic nebudu měnit.Automatický rollback nevrací stack, který před migrací běžel. Dvě díry jsou blocker: rollback stáhne jiné obrazy, a MariaDB mezitím může změnit datadir, který starší server už neotevře. Integrační test to nevidí, protože Matomo v něm není nainstalované a tagy se během běhu nehnou.
+
+## Blocker
+
+### 1. Rollback stáhne jiné obrazy, než které právě běží
+
+`server/migrate-from-crazymax.sh:588-616` pustí starý soubor přes `old_compose up -d --wait` a nikde si neuloží image ID běžících kontejnerů. Starý stack i aktuální upstream crazymax mají `crazymax/matomo:latest`, `crazymax/msmtpd:latest` a `crazymax/geoip-updater:latest` (`test/migration/docker-compose.crazymax.yml:26,34,44`). Nový stack ty dva poslední tagy přebírá z `server/.env.example:26-27`.
+
+Docker u výchozí `pull_policy: missing` píše: tag `latest` se stáhne vždy, i když obraz lokálně je. Zdroj: [container spec, pull_policy](https://docs.docker.com/reference/compose-file/container-spec/#pull_policy). `server/compose.yml:8-9` tvrdí opak a `server/matomo-update.sh:228-233` pak `:275` na tom staví i pozdější rollback timeru: přetaguje staré ID a zavolá `up`, které `:latest` znovu stáhne a tag přepíše.
+
+Scénář: kontejner měsíce běží na `crazymax/matomo:latest` = 5.2.0. Na Hubu je `latest` mezitím 5.14. Migrace schématu selže, skript obnoví dump se schématem 5.2 a hlásí `rollback_succeeded` (`migrate-from-crazymax.sh:614`). `up` stáhne dnešní `latest`, entrypoint v `rootfs/etc/s6-overlay/scripts/config-main:17` znovu spustí `core:update` a schéma migruje dopředu. Když je Hub nedostupný nebo rate-limitne, `up` spadne, skončí to exit 2 a původní image ID leží na disku nepoužité. Stejný pull `:latest` pro msmtpd a geoip prodlouží i samotné přepnutí, přestože `check_new_images` obrazy už stáhl.
+
+Ověření: u běžícího `crazymax/matomo:latest` zaznamenat `docker inspect --format '{{.Image}}'`, na Hubu posunout tag (nebo ho v testu přetagovat na jiný lokální obraz), spustit migraci na obraz, který neprojde healthcheckem, a po rollbacku porovnat image ID. Druhý běh: stejný postup s odpojeným Hubem (`--network none` na daemonu nejde; stačí špatný `HTTP_PROXY`). U timeru: `docker tag` staré ID na `crazymax/msmtpd:latest`, pak `docker compose up -d msmtpd` a znovu `docker inspect`.
+
+Oprava: před přepnutím uložit image ID všech šesti kontejnerů. Rollback i `matomo-update.sh` ať dělají `docker tag <staré-id> <ref>` a pak `docker compose up --pull never`. V `server/compose.yml` nastavit `pull_policy: missing` explicitně a u obrazů, které mají zůstat na konkrétním buildu, nepoužívat `:latest`. Komentář na `compose.yml:8-9` srovnat s dokumentací.
+
+### 2. Pin MariaDB nezabrání změně datadiru a rollback ho neumí vrátit
+
+`server/migrate-from-crazymax.sh:397-398` skládá tag `mariadb:<major>.<minor>` z `SELECT VERSION()`, ne digest běžícího kontejneru. `server/compose.yml:28` má `MARIADB_AUTO_UPGRADE=1`. Oficiální entrypoint při neshodě `mysql_upgrade_info` spustí `mariadb-upgrade` a zálohuje jen systémovou databázi `mysql` (`system_mysql_backup_*.sql.zst` v datadiru). Uživatelská data nemění, formát datadiru a systémové tabulky ano. MariaDB in-place downgrade nepodporuje a netestuje; od 10.8 navíc mění formát InnoDB redo logu, který 10.6 nepřečte ([Downgrading MariaDB](https://mariadb.com/docs/server/server-management/install-and-upgrade-mariadb/downgrading-between-major-versions-of-mariadb)).
+
+Logický dump v `create_backup` (`migrate-from-crazymax.sh:512-516`) je jen aplikační databáze. Rollback ho nalije zpět do téhož datadiru a starý soubor nastartuje s `image: mariadb:10` (`test/migration/docker-compose.crazymax.yml:7`). Tag `mariadb:10` na hostu může ukazovat na jiný build, než na kterém kontejner vznikl: typicky se tag posunul pullem, kontejner se nepřetvořil, `VERSION()` pořád vrací 10.6.x, skript stáhne novější `mariadb:10.6`, upgrade proběhne, rollback pak pustí lokální `mariadb:10`, které je už 10.11.
+
+`MIGRATION.md:69-70` říká, že migrace datadir neupgraduje. Ruční postup v `MIGRATION.md:150-153` naopak pinuje `mariadb:10.11` a upgrade z 10.4–10.6 bere jako bezpečný. `MIGRATION.md:356-358` radí při rollbacku nechat ve starém souboru `mariadb:10.11`. Skript starý soubor takhle nepřepíše.
+
+Scénář: datadir 10.11.8, Hub má `mariadb:10.11` = 10.11.20. Nový kontejner doběhne `mariadb-upgrade`, Matomo healthcheck spadne, aplikační dump se obnoví, systémové tabulky zůstanou po 10.11.20, starý binární soubor 10.11.8 nenastartuje, exit 2. Fyzická kopie datadiru neexistuje.
+
+Ověření: kontejner z konkrétního digestu 10.11.x, migrace na dnešní `mariadb:10.11`, v logu entrypointu hledat `Starting mariadb-upgrade` a soubor `system_mysql_backup_*.sql.zst`. Po vynuceném pádu Matomo zkusit nastartovat původní digest nad týmž adresářem.
+
+Oprava: do nové compose dát digest z `docker inspect --format '{{.Image}}'` běžícího `db`, `MARIADB_AUTO_UPGRADE` při migraci nedávat a `up --pull never`. Upgrade MariaDB nechat na pozdější okno s fyzickou kopií zastaveného datadiru (`cp -a --reflink=auto` nebo snapshot). Logický dump nechat pro schéma Matomo. Text v `MIGRATION.md:69-70` a `:150-153` sjednotit s tím, co skript opravdu pouští.
+
+## Major
+
+### 3. HTTP kontrola na nainstalovaném Matomu buď falešně shodí úspěšnou migraci, nebo projde, i když aplikace nefunguje
+
+`server/migrate-from-crazymax.sh:552-557` bere jako úspěch každé HTTP < 400 a redirecty nesleduje. `matomo-update.sh:289-293` dělá totéž. Entrypoint stihne `core:update` ještě před touto kontrolou (`config-main:17`).
+
+Scénář A: v `config.ini.php` je `trusted_hosts[]` veřejné jméno, ne `127.0.0.1`. Matomo vrací 400, `curl -f` spadne, skript obnoví dump a zahodí data zapsaná od dumpu, přestože kontejner naběhl. Scénář B: `force_ssl=1` vrátí 302 na HTTPS. Bez `-L` je 302 úspěch, rozbitá aplikace za redirectem projde a timer se nainstaluje.
+
+Ověření: nainstalované Matomo s `trusted_hosts[] = actual.host` a druhé s `force_ssl=1`, migrace na zdravý obraz, kód odpovědi `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/`.
+
+Oprava: kontrolovat URL, kterou Matomo samo bere jako kanonickou (z `General.trusted_hosts` / reverse proxy), povolit očekávané kódy explicitně a u 301/302 jít na cílovou stránku jen na loopback. `core:update` brát jako podmínku zdraví, ne jako krok až za HTTP.
+
+### 4. Cron naběhne dřív než ověření a selhání `core:update` při startu kontejner nezastaví
+
+`migrate-from-crazymax.sh:634` dělá `up -d --wait` na celý projekt. Cron má `depends_on: matomo: service_healthy` (`server/compose.yml:100-103`), takže archivace startuje před `verify_new_stack`. `matomo-update.sh:274-283` to má oddělené: nejdřív služby bez cronu, pak verify, pak cron.
+
+`config-main` nemá `set -e`. `console core:update` na řádku 17 může spadnout a skript pokračuje `config:set` a skončí 0. s6 stage 2 proto neselže. Healthcheck je `curl` na `127.0.0.1:12345/ping` (`rootfs/usr/local/bin/healthcheck:8`), ne výsledek migrace. `up --wait` tedy vrátí úspěch i po rozbité migraci schématu. Verify je jediná záchrana a běží už souběžně s archivací.
+
+Scénář: migrace 5.2 → 5.14 spadne v půlce (timeout, deadlock). Nginx naběhne, cron začne archivovat proti rozjetému schématu, verify teprve potom pustí `core:update` znovu.
+
+Ověření: obraz, jehož `core:update` skončí nenulově až po částečném ALTER. Sledovat, jestli `up --wait` skončí 0 a jestli cron v tu chvíli už běží (`docker compose ps`).
+
+Oprava: stejné pořadí jako v `matomo-update.sh`. V `config-main` zapnout `set -e`, nebo kontrolovat exit code `core:update` a skončit nenulově.
+
+### 5. Po zastavení cronu není past na přerušení
+
+`switch` (`migrate-from-crazymax.sh:620-627`) zastaví cron a dumpuje. `fail` a `set -e` při chybě dumpu cron zvednou. SIGINT, SIGTERM, pád `jq` v `log()` nebo zabití procesu mezi `stop cron` a `rollback` past nemají. Skript žádný `trap` nemá. `matomo-update.sh` taky ne. Systemd u timeru má `TimeoutStartSec=3h` (`server/systemd/matomo-update.service:14`) a po něm pošle SIGKILL celé cgroup: u velké databáze dump plus dvakrát `WAIT_TIMEOUT` (výchozí 2400 s) plus rollback tuhle hranu překročí a rollback zůstane v půlce.
+
+Scénář: operátor přeruší dump po `stop cron`. Matomo dál sbírá hity, archivace už neběží, skript nic nevrátí. Nebo systemd zabije `matomo-update.sh` uprostřed `restore_backup`.
+
+Ověření: `kill -TERM` po logu `backup` a před `downtime_started`. `systemctl show matomo-update -p TimeoutStartSec` proti času dumpu na kopii produkční DB.
+
+Oprava: `trap` na EXIT/INT/TERM se stavem (cron zastaven / soubory přesunuty / nový stack nahoře) a odpovídajícím úklidem. U timeru `TimeoutStartSec` dopočítat z `WAIT_TIMEOUT_SECONDS` a doby dumpu, nebo timeout vypnout a hlídat ho ve skriptu.
+
+### 6. „Nic se nezměnilo“ už neplatí v momentě, kdy se skript ptá
+
+`main` (`migrate-from-crazymax.sh:690-696`) zapíše `NEW_DIR` a stáhne obrazy před `confirm`. Odmítnutí volá `fail aborted` s textem „nothing was changed“ (`:504`). Na disku zůstane `.env` s heslem DB, `msmtpd.env` a `geoip-updater.env` (chmod 600) a další běh skončí na `NEW_DIR is not empty` (`:286-287`).
+
+`--dry-run` volá `check_new_images` (`:683`), tedy `docker compose pull`. To posune lokální tagy `crazymax/msmtpd:latest` a `crazymax/geoip-updater:latest`, na které pořád ukazuje starý stack. Test (`test/migration/run.sh:120-126`) hlídá jen image ID Matomu a soubory.
+
+Scénář: operátor dává N. Další pokus odmítne neprázdný `NEW_DIR`. Mezitím někdo v `OLD_DIR` udělá `docker compose up --pull never` a msmtpd nastartuje digest stažený dry-runem.
+
+Ověření: migrace bez `--yes`, odpovědět `n`, `ls NEW_DIR` a `docker image inspect crazymax/msmtpd:latest` před a po dry-runu.
+
+Oprava: generovat config do dočasného adresáře, pull taky, a do `NEW_DIR` kopírovat až po souhlasu. Při abortu adresář smazat. Dry-run ať pull nedělá, nebo ať pulluje pod jinými tagy. Text hlášky změnit.
+
+### 7. Dump může zaplnit disk živé databáze, skript místo na to nekouká
+
+`create_backup` (`migrate-from-crazymax.sh:507-518`) píše gzip vedle dat: `BACKUP_DIR` je `dirname(web_dir)/backups` (`:336`). Kontrola volného místa není. Ruční postup v `MIGRATION.md:122` a `:158-159` `df` požaduje, skript ne. Dump běží za chodu InnoDB (`--single-transaction`), undo log roste na tom samém disku.
+
+Scénář: DB 80 GB, volno 40 GB, gzip se na to nevejde, nebo se vejde dump a ne undo log. MariaDB přestane zapisovat ještě před `move_old_files`. Skript dump vyhodnotí jako chybu, nastartuje cron a skončí 1 s tím, že se nic nezměnilo. Datadir je plný.
+
+Ověření: malý oddíl, dump větší než volno, sledovat `df` a `docker compose logs db` během `create_backup`.
+
+Oprava: před dumpem vyžadovat volné místo aspoň ve výši `du` datadiru (koeficient v konfiguraci, ne magické číslo v kódu) na jiném filesystému, než je datadir. Dump psát do `.partial` a přejmenovat až po `gzip -t`, jako to dělá `matomo-update.sh:249-258`.
+
+### 8. Z běžícího stacku se přenáší jen část konfigurace a Redis se tiše vymění za 8
+
+Mounty se kontrolují u db, matomo, cron a geoip (`migrate-from-crazymax.sh:325-328`). Redis a msmtpd ne. `fill_defaults_from_example` (`:423-424`) bere `REDIS_IMAGE` z example, tedy `redis:8-alpine` (`server/.env.example:25`). Upstream crazymax má pořád `redis:4.0-alpine` a README toho obrazu Redis uvádí i jako frontu pluginu QueuedTracking. Příkaz `db` se nečte: nový soubor natvrdo dává tři flagy (`server/compose.yml:14-17`). Labely, další sítě a `container_name` se nepřenášejí.
+
+Scénář: produkce má na `db` příkaz `--innodb-buffer-pool-size=8G`. Po migraci jede výchozí buffer pool, `mariadb-admin ping` je zelený, timer se nainstaluje, pod zátěží DB spadne. Druhý scénář: síť `traefik` a labely na `matomo`. Verify na `127.0.0.1:8000` projde, veřejné jméno za Traefikem nejde. Třetí: QueuedTracking má ve frontě hity, které v SQL dumpu nejsou. Nový Redis je prázdný a major 8. Čtvrtý: bind mount na Redis (AOF) skript nezmínní a v novém compose není.
+
+Ověření: ke crazymax souboru přidat buffer pool, síť, label a redis volume; po migraci `docker inspect` Command, Networks a Mounts.
+
+Oprava: před přepnutím srovnat `Config.Cmd`, `HostConfig.Binds`/`Mounts`, `NetworkSettings.Networks` a labely se seznamem, který nový compose umí vyjádřit. Cokoli navíc ať migraci zastaví. Redis pinout na běžící obraz, dokud není samostatný krok. Před vypnutím cronu vyprázdnit frontu QueuedTracking, pokud je plugin zapnutý (`config.ini.php`).
+
+### 9. Existující soubor timeru se nechá být, i když ukazuje jinam
+
+`server/install-timer.sh:37-39` při existujícím `/etc/matomo-update/matomo-update.env` soubor nepřepíše a jen znovu zapne timer. Jednotka se přepíše (`:48-54`), cesta v env ne. Migrace pak skončí 0 (`migrate-from-crazymax.sh:644-650`).
+
+Scénář: na stroji už timer je, z dřívější ruční instalace nebo z testu, a `COMPOSE_DIR` ukazuje na `OLD_DIR`. Po migraci v `OLD_DIR` compose není (soubory jsou v `_old_`). Timer dál spouští update proti staré cestě. Test to nevidí, protože `test/migration/run.sh:54` adresář `/etc/matomo-update` předem maže.
+
+Ověření: před migrací založit env s jiným `COMPOSE_DIR`, po migraci `systemctl cat` a `grep COMPOSE_DIR`.
+
+Oprava: když soubor existuje a `COMPOSE_DIR` nebo `HEALTH_URL` nesedí na právě migrovaný stack, skončit exit 3 a vypsat diff. Nepřepisovat hesla, přepsat cesty.
+
+### 10. `--start-period` může být delší než čekání na healthcheck
+
+`fill_defaults_from_example` (`migrate-from-crazymax.sh:427-430`) převezme `--start-period` a timeout nechá na example (2400 s), pokud není `--wait-timeout`. Compose během `start_period` neúspěšné probe nepočítá (`server/compose.yml:92-96`). `up --wait` mezitím vyprší.
+
+Scénář: `--start-period 3600s` na velké databázi, výchozí timeout 2400 s. Migrace schématu pořád běží, `up` vrátí chybu, rollback obnoví dump a zahodí i to, co už `core:update` stihl. Ruční postup v `MIGRATION.md:97-100` ty dvě hodnoty nesvazuje.
+
+Ověření: `--start-period 30s --wait-timeout 5` na obrazu, který je zdravý až od 10. sekundy.
+
+Oprava: parsovat duration a odmítnout start, když `WAIT_TIMEOUT_SECONDS` není větší než start period (rezerva na dump a cron). To samé hlídat v `matomo-update.sh` proti `MATOMO_START_PERIOD` z `.env` stacku.
+
+### 11. Zelený integrační test nepokrývá cestu, na které migrace reálně běží
+
+`test/migration/run.sh:5-13` a `:128-135` staví neinstalované Matomo bez `[database]`. Rozbitý obraz neselže v `core:update`; healthcheck smaže tabulku (`test/integration/broken-healthcheck.sh:4-10`). `MATOMO_INSTALLED` zůstane false, takže `migrate-from-crazymax.sh:523-525` a `:566-570` se nespustí. Marker v prázdné DB projde i dumpem s jednou tabulkou. Image ID MariaDB, msmtpd a geoip se po rollbacku neporovnávají (`run.sh:133`).
+
+Tím test nechytí nálezy 1, 2, 3 a 4. Hláška „výpadek 31 s, rollback obnovil tabulku“ platí pro prázdný sklad, ne pro nainstalovanou instanci.
+
+Ověření: v testu projít instalaci (config s `[database]`, aspoň základní tabulky Matomo), migraci o minor verzi výš, pád uprostřed `core:update`, a assert na image ID všech služeb plus počet tabulek a `option.version_core`.
+
+Oprava: ten test doplnit dřív, než se skript pustí na produkci. Do té doby tvrzení „žádná ztráta dat“ a „rollback vrací původní stack“ berte jako neověřená.
+
+## Minor
+
+### 12. `rmdir` po návratu souborů umí zrušit zbytek rollbacku
+
+`restore_old_files` (`migrate-from-crazymax.sh:541-549`) po `mv` vyžaduje úspěšný `rmdir`. Selhání vrátí 1 a `rollback` (`:591-594`) skončí exit 2 ještě před startem staré DB. V tu chvíli už proběhlo `new_compose down`.
+
+Scénář: v `_old_` zůstane soubor, který smyčka nepřesune (soubor vzniklý během rollbacku). Soubory jsou zpátky, databáze leží, skript dál nejde.
+
+Ověření: po `mv` a před `rmdir` vytvořit v `_old_` soubor (stačí upravit test, nebo `mkdir` v `_old_` během pauzy).
+
+Oprava: neprázdný `_old_` logovat a pokračovat v obnově DB a startu starého stacku. Úklid adresáře není podmínka návratu služby.
+
+### 13. Obnova `config/` nemaže soubory, které přibyly po dumpu
+
+`rollback` (`migrate-from-crazymax.sh:606-608`) dělá `tar -xzf` do existujícího `config/`. Tar přepíše stejná jména a nechá nové soubory po `core:update` a po `config:set` z entrypointu.
+
+Scénář: nová verze přidá `config.ini.php.bak` nebo klíč, který starý kód čte jinak. Po „úspěšném“ rollbacku je v configu směs.
+
+Ověření: po startu nového obrazu přidat soubor do `config/`, vynutit rollback, `diff -r` proti taru.
+
+Oprava: před rozbalením `config/` přejmenovat stranou a rozbalit do prázdného adresáře. Když rozbalení selže, vrátit přejmenovaný strom.
+
+### 14. Kontrola dumpu je slabší, než říká dokumentace, a heslo z ini se nečte
+
+`MIGRATION.md:237` chce desítky `CREATE TABLE`. Skript při `MATOMO_INSTALLED` odmítne jen nulu (`migrate-from-crazymax.sh:523-525`). Heslo v `config.ini.php` se nesrovnává s `MYSQL_PASSWORD` (`:405-411`), jen host, uživatel a databáze.
+
+Scénář: uživatel má `SELECT` jen na část schématu, dump skončí 0, obsahuje `-- Dump completed` a jednu tabulku. Rollback „projde“ a zbytek schématu chybí. Nebo ini heslo nesedí na env, dump spadne až po potvrzení, kdy už je cron dole. To druhé je bezpečné co do dat, ale je to zbytečný výpadek archivace.
+
+Ověření: dump účtu s právem jen na jednu tabulku; ini s jiným heslem než env.
+
+Oprava: u nainstalované instance vyžadovat práh tabulek (konfigurace, ne konstanta ve skriptu) a shodu hesla. Práh vzít z počtu tabulek, které Matomo v té verzi zakládá, a ověřit ho testem.
+
+### 15. Úvod dokumentace slibuje výpadek pod minutu
+
+`MIGRATION.md:7-8` a `README.md:87` říkají, že Matomo nejede jen po dobu přetvoření kontejnerů, obvykle pod minutu. Downtime ve skriptu je od `move_old_files` po konec `up --wait` (`migrate-from-crazymax.sh:628-641`) a uvnitř něj běží `core:update`. 31 s je výsledek testu bez schématu. Na velké databázi je to délka migrace schématu, nahoře omezená timeoutem, který se při překročení mění v rollback.
+
+Ověření: migrace s reálným `core:update` a `time` kolem `downtime_started` / `downtime_ended`.
+
+Oprava: v úvodu psát, že výpadek zahrnuje migraci schématu a že prázdná instalace není odhad pro produkci.
+
+### 16. Port se nebere z běžícího kontejneru
+
+Hlavička (`migrate-from-crazymax.sh:25-28`) říká, že se konfigurace čte z běžících kontejnerů. Port se čte z `docker compose config` (`:339-343`), ne z `HostConfig.PortBindings`.
+
+Scénář: soubor na disku má `8001`, kontejner pořád publikuje `8000`, proxy míří na `8000`. Migrace zveřejní `8001`, verify cílí na `8001` a projde, uživatelé na `8000` nic nemají.
+
+Ověření: změnit port v souboru, kontejner nerecreatovat, dry-run, srovnat plán s `docker port`.
+
+Oprava: publikovaný port brát z inspectu kontejneru a při neshodě se souborem migraci zastavit.
+
+## Co ověřit dřív, než se to pustí na produkci
+
+Na kopii produkčního datadiru, s nainstalovaným Matomo a `trusted_hosts`: migrace na novější minor, vynucený pád uprostřed `core:update`, pak srovnání image ID všech služeb, `option.version_core`, počtu tabulek a toho, že `mariadb-upgrade` v logu db není. Zvlášť pak `docker compose up` starého souboru s odpojeným registrem.
+
+--- Iteration 1: Evaluation ---
+Accepted and implemented in commits 77df437, 57647b9, 4d73952 (fixes 1-11 as listed in the iteration 2 prompt).
+
+--- Iteration 2: Prompt ---
+Posuď kriticky RE-CHECK opravené verze. Nehledej potvrzení, hledej chyby.
+
+Kontext: v předchozím kole jsi (a druhý nezávislý reviewer) posuzoval migrační skript server/migrate-from-crazymax.sh a související soubory v tomto repozitáři (pracovní adresář). Na základě nálezů vznikly opravy v commitech 9695cf5..HEAD (zobraz si je: `git diff 9695cf5..HEAD`, `git log 9695cf5..HEAD`).
+
+Shrnutí provedených změn:
+1. Migrace nemění verze softwaru: db/redis/msmtpd/geoip-updater běží při přepnutí na přesných starých obrazech (RepoDigest), Matomo na obrazu tohoto repa se STEJNOU verzí (pokud existuje tag <repo>:<stará verze>), jinak fallback na sledovaný obraz s varováním. Po úspěchu se .env přepne na sledované řady (finalize_env) a upgrady udělá matomo-update.sh z timeru.
+2. Rollback (migrace i matomo-update.sh) obnovuje dump jen když se změnil fingerprint schématu (server/lib/db.sh: sloupce tabulek mimo archive_* + option version_*), jinak data zachová.
+3. Všechna `compose up` mají `--pull never` (Compose spec: latest tag se stahuje i při pull_policy missing); rollback přetaguje přesná stará image ID.
+4. EXIT/INT/TERM/HUP trap s fázemi (backup → restart cronu, switching → rollback) v migraci i v update skriptu.
+5. Compose běží bez COMPOSE_* a .env klíčů v prostředí; vygenerovaný model se ověřuje proti plánu (validate_generated).
+6. umask 077, UMask=0077 v systemd, kontrola volného místa před dumpem, dump přes .partial.
+7. Odmítnutí nepodporovaných nastavení (sítě, labely, container_name, override command/entrypoint, db command, volumes u redis/msmtpd, QueuedTracking, rozdíl portu běžícího kontejneru vs. souboru).
+8. install-timer.sh: printf %q do sourcovaného configu, systemd quoting (" \ %), odmítne existující config s jiným COMPOSE_DIR, 4. argument WAIT_TIMEOUT_SECONDS, systemd-analyze verify.
+9. rootfs config-main: selhání core:update ukončí start kontejneru.
+10. HEALTH_URL = /matomo.php (tracker, nezávislý na trusted_hosts/force_ssl); cron v migraci startuje až po ověření.
+11. Rollback: config/ se nahrazuje celý (staré stranou), rmdir _old_ už neblokuje rollback; NEW_DIR se smaže při selhání/odmítnutí před přepnutím.
+
+Ověřeno v CI (ubuntu, skutečný Docker, systemd): unit testy (57, bats), smoke test, integrační test matomo-update.sh (update, rollback s obnovou při změně schématu, blokace), migrační test proti reálnému crazymax stacku (dry-run, neodsouhlasená migrace bez stop, rollback s přesnými image ID všech 6 služeb + obnova DB při změně schématu, úspěšná migrace s exportovanými kolidujícími proměnnými, práva záloh 600/700, .env přepnutý na sledované řady, timer + první běh update skriptu nasadil nové obrazy). Stále NEtestováno: nainstalované Matomo (config.ini.php s [database]) a reálný core:update.
+
+Úkol:
+- Ověř, zda opravy skutečně řeší tvé dřívější nálezy (u každého: vyřešeno / částečně / nevyřešeno + proč).
+- Najdi NOVÉ chyby, které opravy zavedly (regrese, edge cases, nesprávné předpoklady – např. o RepoDigests, fingerprint SQL, traps a set -e, --pull never, finalize_env, chování docker/compose).
+- U každého nálezu: závažnost (blocker/major/minor/nit), soubor:řádek, scénář, jak ověřit, oprava.
+Nepiš do souborů, jen čti. Odpověz česky, seřazeno od nejzávažnějšího. Buď stručný u vyřešených bodů, podrobný u nových problémů.
+
+Note: the first iteration 2 attempt failed technically: Codex waited on stdin (no </dev/null) for over an hour; Grok tried to run a shell command that a headless run cannot approve and stopped without findings. Re-run with </dev/null for Codex and a prepared diff file plus a no-shell instruction for Grok (prompt2_grok.txt = prompt above + that note).
+
+--- Iteration 2: Codex ---
+**RE-CHECK bych zatím neuzavřel. Našel jsem pět problémů závažnosti major a několik menších nedotažených oprav.** Největší problém je nový předpoklad „stejný fingerprint = bezpečné přeskočit obnovu DB“.
+
+Prošel jsem všechny tři commity `9695cf5..HEAD`. Původní posudky nemám v kontextu, proto stav oprav vztahuji k vašim 11 bodům. Níže rozlišuji nové regrese a mezery v opravách.
+
+1. **Major — fingerprint přehlédne částečně provedenou migraci.**  
+   [server/lib/db.sh:37](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/lib/db.sh:37>), použití v [matomo-update.sh:413](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/matomo-update.sh:413>) a [migrate-from-crazymax.sh:887](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/migrate-from-crazymax.sh:887>).
+
+   Hash nezahrnuje indexy, collation, engine ani změny dat. Matomo přitom skutečně používá migrace typu `DROP INDEX` následované `ADD INDEX`; `version_core` aktualizuje až po dokončení aktualizací. Přerušení mezi těmito kroky tedy může ponechat stejný fingerprint, přestože databáze je změněná. Rollback přeskočí obnovu a spustí starou aplikaci například bez důležitého indexu. [SQL příklad Matomo](https://matomo.org/faq/how-to-update/how-to-manually-apply-database-updates-for-a-new-matomo-version/), [průběh migrací](https://developer.matomo.org/guides/updates-aka-migrations).
+
+   **Ověření:** na testovací instalaci zaznamenat fingerprint, odstranit index bez změny `version_core` a vyvolat rollback. Hash zůstane stejný; index se neobnoví. Obdobně lze ověřit neúspěšnou migraci měnící pouze data.
+
+   **Oprava:** rovnost hashe nesmí být důkazem neprovedené migrace. Doplnit strukturální fingerprint a evidenci zahájení migrací; při nedokončené migraci s možnými datovými změnami konzervativně obnovovat. Samotné přidání indexů do hashe nestačí.
+
+2. **Major — detekci QueuedTracking obejde obyčejné odsazení INI.**  
+   [server/lib/matomo-config.sh:25](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/lib/matomo-config.sh:25>).
+
+   Platný řádek `  Plugins[] = "QueuedTracking"` funkce nerozpozná. Migrace tak přijme aktivní frontu, kterou měla odmítnout. Při následném odstranění a vytvoření Redis kontejneru během rollbacku může ztratit nezpracované požadavky; SQL dump je nezachrání. Matomo používá INI parser, který odsazení přijímá. [Implementace parseru](https://github.com/matomo-org/component-ini/blob/master/src/IniReader.php).
+
+   **Ověření provedeno:** stejná funkce nad vstupem přes stdin vrací pro neodsazený řádek úspěch, pro odsazený neúspěch.
+
+   **Oprava:** kontrolovat aktivní pluginy přes Matomo v běžícím kontejneru, případně použít kompatibilní INI parser. Neúspěšné načtení konfigurace musí migraci zastavit.
+
+3. **Major — systemd může zabít právě probíhající rollback.**  
+   [server/systemd/matomo-update.service:14](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/systemd/matomo-update.service:14>), [matomo-update.sh:489](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/matomo-update.sh:489>).
+
+   Nový TERM trap spustí rollback, ale jednotka nastavuje pouze `TimeoutStartSec`. Při `systemctl stop` nebo překročení startup timeoutu platí samostatný `TimeoutStopSec`, standardně 90 sekund. Potom systemd procesy násilně ukončí. Obnova většího dumpu tak může skončit uprostřed, s neúplnou DB a zastavenou aplikací. Tříhodinový startup timeout tomu nebrání. [Dokumentace systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#TimeoutStopSec=).
+
+   **Ověření:** v Linux CI zastavit službu během `applying` a nechat rollback obnovovat DB déle než stop timeout; zkontrolovat SIGKILL v journalu a stav DB.
+
+   **Oprava:** explicitně nastavit časový rozpočet pro dokončení rollbacku a sladit jej s podporovanými timeouty. Jde o nedokončenou ochranu před přerušením, nikoli chybu samotného Bash trapu.
+
+4. **Major — přetagování neobnoví přesná ID, pokud služby sdílejí tag, ale běží na různých obrazech.**  
+   [server/migrate-from-crazymax.sh:877](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/migrate-from-crazymax.sh:877>).
+
+   Typický scénář: někdo dříve aktualizoval pouze `matomo`; `cron` zůstal na starším obrazu. Obě služby mají v Compose `crazymax/matomo:latest`. Preflight tuto kombinaci neodmítne. Rollback nejprve přetaguje ID Matomo a následně stejný tag přepíše ID cronu. Obě služby potom nastartují z obrazu cronu. `--pull never` tento problém neřeší.
+
+   **Ověření:** připravit rozdílná běžící ID pod společnou referencí, vynutit rollback a porovnat ID každé služby před/po. Současný integrační test začíná se shodnými obrazy Matomo a cronu.
+
+   **Oprava:** použít při rollbacku samostatné reference pro jednotlivé služby, nebo takovou výchozí kombinaci odmítnout před přepnutím. Po rollbacku ověřovat skutečná ID kontejnerů.
+
+5. **Major — kontrola místa může při aritmetické chybě propustit nedostatečnou kapacitu.**  
+   [server/migrate-from-crazymax.sh:730](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/migrate-from-crazymax.sh:730>), [matomo-update.sh:275](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/matomo-update.sh:275>).
+
+   Starší `mawk`, například verze dodávaná s Ubuntu 22.04, tiskne větší čísla exponenciálně: `3.14573e+09`. Bash takovou hodnotu v `((free < need))` odmítne. Protože výraz stojí v podmínce `if`, skript pokračuje, jako kdyby místa bylo dost. Záloha může zaplnit i filesystem živé databáze. [Implementace mawk](https://raw.githubusercontent.com/ThomasDickey/mawk-snapshots/t20200120/print.c).
+
+   **Ověření:** na příslušném mawk spustit `awk 'BEGIN { print 3072000 * 1024 }'`. Bash část jsem ověřil: s `free=3.14573e+09` a `need=5000000000` kontrola vypíše chybu, ale projde.
+
+   **Oprava:** použít `printf "%.0f\n"` a explicitně ověřovat úspěch `df` i celočíselnost obou hodnot. Chyba měření musí zálohu zastavit.
+
+6. **Minor — čištění prostředí nepokrývá platné zápisy `.env`.**  
+   [server/matomo-update.sh:485](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/matomo-update.sh:485>).
+
+   Regex přehlédne například `MYSQL_PASSWORD = file-value`. Exportovaná proměnná potom dál přebíjí soubor. Stejně lze ovlivnit obraz nebo datovou cestu. Generovaná `.env` má správný formát; problém nastane po běžné ruční úpravě.
+
+   **Ověřeno read-only přes Compose:** zápis s mezerou přijímá, exportovaná hodnota vyhraje a regex klíč nenajde. [Podporovaná syntaxe](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/).
+
+   **Oprava:** podporovanou syntaxi skutečně parsovat, nebo nekanonický zápis explicitně odmítnout.
+
+7. **Minor — opakovaná instalace timeru ignoruje nový timeout.**  
+   [server/install-timer.sh:88](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/install-timer.sh:88>).
+
+   Existující config se stejným `COMPOSE_DIR` zůstane celý zachován. Například timeout `2400` zůstane i po volání s argumentem `4000`, přestože stack nyní používá start period `3600s`. Instalátor oznámí úspěch, každý update však skončí na kontrole timeoutu.
+
+   **Ověření:** zopakovat instalaci nad stejným adresářem po zvýšení start period a spustit službu.
+
+   **Oprava:** před oznámením úspěchu validovat účinnou konfiguraci; nesoulad explicitně odmítnout nebo aktualizovat příslušné hodnoty.
+
+8. **Minor — `finalize_env` může zanechat směs připnutých a sledovaných obrazů.**  
+   [server/migrate-from-crazymax.sh:965](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/migrate-from-crazymax.sh:965>).
+
+   Klíče se nahrazují jednotlivě. Selhání zápisu nebo přerušení mezi nimi nastane už ve fázi `switched`, kterou EXIT trap neřeší. Zůstane částečně změněná `.env`, timer se nenainstaluje a běžné selhání vrátí kód `1`, přestože migrace nebyla vrácena.
+
+   **Ověření:** v testovacím prostředí přerušit finalizaci po první náhradě a zkontrolovat `.env`, timer a návratový stav.
+
+   **Oprava:** sestavit a validovat celý finální soubor vedle původního, potom jej atomicky přejmenovat. Selhání po přepnutí hlásit samostatným stavem.
+
+9. **Minor — úklid NEW_DIR nepokrývá všechny slíbené případy.**  
+   [server/migrate-from-crazymax.sh:637](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/migrate-from-crazymax.sh:637>), [řádek 916](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/migrate-from-crazymax.sh:916>).
+
+   Předem existující prázdný adresář nedostane `NEW_DIR_CREATED=true`, takže po odmítnutí zůstanou vygenerované soubory. Při signálu ve fázi `backup` se adresář neuklidí ani tehdy, když ho skript vytvořil. Opakovaný pokus odmítne neprázdný cíl.
+
+   **Ověření:** odmítnout migraci do předem vytvořeného prázdného adresáře; samostatně přerušit zálohování.
+
+   **Oprava:** evidovat vytvořené soubory nezávisle na vlastnictví adresáře a uklízet všechny větve před přepnutím.
+
+Stav vašich původních bodů:
+
+| Bod | Stav | Důvod |
+|---|---|---|
+| 1. Zachování verzí | **Vyřešeno v deklarovaném rozsahu** | Podpůrné obrazy se připínají; fallback Matomo přiznaně může upgradovat. |
+| 2. Podmíněná obnova DB | **Částečně** | Zbytečné obnovy omezuje, ale fingerprint má zásadní falešné shody — nález 1. |
+| 3. `--pull never`, přesné obrazy | **Částečně** | Zákaz pullu opraven; přesná ID negarantuje sdílený tag — nález 4. |
+| 4. Trapy | **Částečně** | Fázování je přítomné; chybí zajištění dokončení pod systemd — nález 3. |
+| 5. Čisté prostředí a validace | **Částečně** | Generovaná konfigurace chráněna; updater přehlíží platnou syntaxi — nález 6. |
+| 6. Práva, místo, `.partial` | **Částečně** | Práva a DB `.partial` opraveny; kontrola místa může selhat otevřeně — nález 5. |
+| 7. Odmítnutí nepodporovaných nastavení | **Částečně** | Kontroly přibyly, ale QueuedTracking může projít — nález 2. |
+| 8. Instalace timeru | **Částečně** | Quoting a kontrola jiného adresáře opraveny; existující timeout neověřuje — nález 7. |
+| 9. Selhání `core:update` zastaví start | **Vyřešeno staticky** | Návratový kód se propaguje přes s6; reálná instalace stále není otestována. |
+| 10. Tracker health URL a pozdější cron | **Vyřešeno v uvedeném rozsahu** | Cesta i pořadí odpovídají opravě. |
+| 11. Obnova configu a úklid | **Částečně** | Nahrazení configu a neblokující `rmdir` opraveny; úklid cíle neúplný — nález 9. |
+
+Do souborů jsem nezapisoval. Dockerové a systemd integrační scénáře jsem znovu nespouštěl; provedl jsem statickou kontrolu, uvedené reprodukce bez zápisu a ověření externího chování v primárních zdrojích. Současné CI s marker tabulkou zejména **neověřuje rozhodující případ: neúspěšnou skutečnou migraci nainstalovaného Matomo s nezměněným fingerprintem**.
+--- Iteration 2: Grok ---
+Posoudím opravy proti dřívějším nálezům a budu hledat nové chyby. Nejdřív si přečtu diff, seznam commitů a aktuální skripty.Předchozí nálezy mám. Teď čtu aktuální skripty a hledám, jestli opravy drží a co nové rozbily.Automatický rollback pořád umí hlásit úspěch nad databází, která už není ta původní. Nejhorší nové díry jsou ve fingerprintu schématu, v tom, že pád health checku shodí i zdravý stack, a v tom, že systemd rollback po 90 s zabije.
+
+## Nové chyby
+
+### 1. Major — fingerprint nelže jen o „schématu“, a chyba dotazu maže data
+
+`server/lib/db.sh:37-41`, rozhodování v `server/migrate-from-crazymax.sh:886-891` a `server/matomo-update.sh:411-417`.
+
+Vzor `table_name NOT LIKE 'matomo\_archive\_%'` vyřadí každou tabulku začínající na `matomo_archive_`. To jsou rotující `archive_numeric_*` / `archive_blob_*`, ale taky trvalá `matomo_archive_invalidations`, kterou migrace Matoma mění (sloupce jako `ts_started`, `processing_host`). Indexy, triggery a čisté DML (UPDATE řádků bez změny sloupců) ve fingerprintu nejsou vůbec. `version_*` se zapisuje až po úspěchu daného kroku updateru.
+
+Scénář: `core:update` stihne `ALTER` na `archive_invalidations` nebo datový UPDATE a spadne dřív, než zapíše `version_*`. Sloupce ostatních tabulek jsou stejné, fingerprint sedí, rollback zaloguje `db_unchanged` a `rollback_succeeded`. Starý kód pak běží nad tabulkou, které chybí nebo přebývá sloupec, případně nad napůl přepsanými řádky. Opačný pól: když dotaz na fingerprint při rollbacku spadne (práva, `SET SESSION group_concat_max_len`, prázdný výstup), je `post` prázdný a skript dump obnoví. Tracking od zálohy se zahodí, i když se schéma nezměnilo.
+
+Ověření: nainstalované Matomo, před přepnutím `SELECT MD5(...)` z `db_fingerprint_sql`. V transakci `ALTER TABLE matomo_archive_invalidations ADD COLUMN probe INT` a rollback bez dalšího DDL. V logu musí být `db_unchanged` a sloupec `probe` pořád existuje. Druhý běh: ve fingerprint SQL dočasně rozbít jméno tabulky `option` a potvrdit, že se obnoví dump.
+
+Oprava: do fingerprintu dát i indexy (`information_schema.statistics`) a trvalé tabulky; vyloučit jen `archive_(numeric|blob)_*`. Obnovu dumpem dělat jen při shodě „dotaz vyšel a hash se liší“. Selhání dotazu je selhání rollbacku (exit 2), ne důvod mazat data.
+
+### 2. Major — health check je na starším curlu chyba příkazu
+
+`server/migrate-from-crazymax.sh:812-813`, `server/matomo-update.sh:358-360`.
+
+`--retry-all-errors` existuje až od curl 7.71. Ubuntu 20.04 má 7.68 a pořád unese Docker Engine 25, který skript vyžaduje. Neznámý přepínač skončí exit 2 dřív, než se naváže spojení. `verify` tedy spadne i na zdravém stacku a spustí rollback. Když už v tom běhu proběhla migrace schématu, zahodí se tracking od dumpu.
+
+Ověření: `curl --retry-all-errors -fsS -o /dev/null http://127.0.0.1:9/` na curl 7.68 (exit 2, text `option --retry-all-errors: is unknown`). Stejný běh migračního skriptu proti zdravému stacku.
+
+Oprava: zjistit `curl --version` a na starším curlu použít `--retry` bez `--retry-all-errors`, nebo health check pustit z kontejneru, kde je curl z obrazu.
+
+Na Matomu s `record_statistics = 0` vrací tracker prázdnému GET **503** (`core/Tracker/Response.php`, větev `shouldRecordStatistics`). `curl -f` to bere jako pád. Stejný falešný rollback, jen za provozu s vypnutým trackováním.
+
+### 3. Major — výpadek pullu konkrétní verze tiše přepne na upgrade
+
+`server/migrate-from-crazymax.sh:607-631`.
+
+`docker pull repo:STARA_VERZE` při jakékoliv chybě (429, timeout, DNS) spadne do stejné větve jako „tag neexistuje“: pull sledovaného `…:5` a přepnutí včetně migrace databáze. Při `--yes` se na to nikdo nepodívá. V plánu je jen varování, které vypadá stejně jako chybějící tag.
+
+Ověření: tag `ghcr.io/hlidacstatu/matomo:5.x.y` ať v registru je. `HTTPS_PROXY=http://127.0.0.1:9` jen kolem prvního pullu (nebo dočasně špatný DNS) a pak normální síť pro pull `:5`. Skript musí skončit chybou pullu, ne plánem „upgrading Matomo“.
+
+Oprava: rozlišit „manifest unknown“ od ostatních chyb pullu. Cokoli jiného než neexistující tag je `pull_failed` a konec. Když label sledovaného obrazu už rovná se běžící verzi, nastavit `SAME_MATOMO_VERSION` (dnes se nastaví jen při tagu `repo:přesná verze`, takže stejná verze na `:5` pořád hlásí migraci).
+
+### 4. Major — prázdný existující NEW_DIR se po odmítnutí nesmaže
+
+`server/migrate-from-crazymax.sh:401-403`, `637-639`, `721`, `916-918`.
+
+Povolený vstup je i existující prázdný adresář. `NEW_DIR_CREATED` se nastaví jen když adresář předtím nebyl. Po „ne“ nebo chybě před přepnutím trap maže jen adresář, který sám založil. Hláška pořád říká `nothing was changed`. Na disku zůstane `.env` s heslem a další env soubory (mode 600). Další běh skončí na `NEW_DIR is not empty`.
+
+Ověření: `mkdir new && migrate … old new </dev/null` bez TTY. Exit 1, v `new/.env` je `MYSQL_PASSWORD`, druhý běh odmítne neprázdný adresář.
+
+Oprava: mazat obsah vždy, když je fáze `idle` a do adresáře skript v tomhle běhu zapisoval. Hlášku o „nic se nezměnilo“ navázat na to, že adresář po sobě opravdu nezůstal.
+
+### 5. Major — po úspěšném přepnutí `finalize_env` vrací exit 1
+
+`server/migrate-from-crazymax.sh:58-60`, `959`, `965-973`.
+
+`PHASE=switched` se nastaví před `finalize_env`. Selhání zápisu `.env` nebo `docker compose config` volá `fail`, tedy exit 1. Hlavička i `MIGRATION.md` říkají, že 1 znamená „vrátilo se to“. Trap v té fázi rollback nedělá. Stack už běží na novém compose, `.env` může být přepsaný jen z části (pořadí klíčů v asociativním poli je náhodné). Exit 3, který na tenhle stav sedí, má jen pád timeru.
+
+Ověření: po zdravém `up` a před `finalize_env` udělat `.env` needitovatelný (`chattr +i` nebo plný disk na `mktemp`). Exit kód a `docker compose ps`.
+
+Oprava: po `PHASE=switched` už neexitovat 1. Buď exit 3 (stack běží, dokončení selhalo), nebo při částečném zápisu `.env` vrátit původní soubor.
+
+### 6. Major — trap rollback spustí a systemd ho za 90 s zabije
+
+`server/migrate-from-crazymax.sh:1006-1007`, `912-927`; `server/matomo-update.sh:489-499`, `521`; `server/systemd/matomo-update.service:13-14`.
+
+INT/TERM/HUP dělá `exit 130`, EXIT trap ve fázi `switching`/`applying` pustí `rollback`. V unitě je `TimeoutStartSec=3h` a není `TimeoutStopSec` (systemd default 90 s, `KillMode=control-group`). Po vypršení startu přijde SIGTERM, rollback se rozběhne, za 90 s SIGKILL. Dump velké DB plus druhý `WAIT_TIMEOUT` (výchozí 2400 s) se do 3 h startu vejde špatně a do 90 s stopu nevejde vůbec. Druhé Ctrl+C během rollbacku trap pořád překládá na `exit 130`, takže přeruší i obnovu.
+
+Ověření: v unitě dočasně `TimeoutStartSec=30` a `WAIT_TIMEOUT` větší než dump. `systemctl start matomo-update` během `up --wait`. V `journalctl` nejdřív `interrupted` / `rollback_started`, pak `killed` (SIGKILL) a `systemctl show -p TimeoutStopUSec`.
+
+Oprava: `TimeoutStopSec` aspoň na dobu restore + jednoho waitu, `TimeoutStartSec` dopočítat z `WAIT_TIMEOUT_SECONDS` (dva waity + dump). Ve `rollback` signály ignorovat nebo je jen zalogovat. `SendSIGKILL=no` jen pokud má rollback vlastní strop.
+
+### 7. Major — rollback DB nejdřív nastartuje starý binární soubor a někdy dump vůbec nespustí
+
+`server/matomo-update.sh:446-461`, `404-420`; `server/compose.yml:29-30`.
+
+Tagy se vrací na staré image ID dřív, než se sahá na data. `restore_backup` pak dělá `up --pull never` na db. Oficiální entrypoint spustí `mariadb-upgrade`, když je v datadiru vyšší major/minor, nebo chybí `mariadb_upgrade_info`. Logický dump je jen aplikační databáze (`--databases`), systémové tabulky nevrátí. Když starý `mariadbd` nad upgradovaným datadirem nenaběhne, funkce skončí na řádku 406 a k dumpu ani k obnově `config/` se nedostane.
+
+Samostatně: restore se volá jen při `app_changed`. Změna samotného obrazu db zálohu pořídí, ale při rollbacku ji nepoužije.
+
+Přepnutí migrace samo MariaDB neupgraduje (pin digestu, v testu sedí image ID). Díra je další běh timeru, jakmile `.env` ukazuje na jinou minor řadu, nebo starý datadir bez `mariadb_upgrade_info`. Patch ve stejné minor řadě entrypoint neupgraduje.
+
+Ověření: datadir se `mariadb_upgrade_info` z 10.11, v `.env` dočasně `mariadb:11.4`, healthcheck Matoma ať spadne. Po rollbacku `docker compose logs db` (odmítnutí downgrade) a absence `db_restore` v logu. Vedle toho běh, kde se změní jen obraz db.
+
+Oprava: při změně image ID databáze rollback nedělat přepnutím binárky nad stejným datadirem. Buď fyzická kopie zastaveného datadiru před recreate, nebo nejdřív nastartovat tu verzi, která datadir právě zapsala, obnovit aplikační dump tam, a downgrade MariaDB odmítnout s exit 2 a návodem. `app_changed` jako podmínku restore zrušit, jakmile se měnil obraz db.
+
+### 8. Major — updater neumí dump na MariaDB, kterou migrace schválně nechá běžet
+
+`server/matomo-update.sh:292-296` versus `server/migrate-from-crazymax.sh:748-751` a `server/lib/db.sh:19-21`.
+
+Migrace spadne na `mysqldump`, když v obrazu není `mariadb-dump` (klientské jméno až od řady 10.5). Update skript volá natvrdo `mariadb-dump` v běžícím kontejneru, tedy ve starém obrazu. Záloha je podmínka recreate, jakmile se mění app nebo db. První běh timeru po migraci takový je. Na 10.4 a starším dump spadne, tagy se vrátí, stack zůstane na starých obrazech natrvalo. Data v bezpečí, upgrade nejde udělat tím skriptem, který ho teď má dělat.
+
+Ověření: `docker run --rm mariadb:10.4 command -v mariadb-dump; command -v mysqldump`. Na takovém datadiru migrace a pak `systemctl start matomo-update`. V logu `backup_failed` / `update_aborted`.
+
+Oprava: stejný fallback jako v migraci, ideálně sdílený snippet v `server/lib/db.sh`.
+
+### 9. Major — po migraci obyčejné `docker compose up -d` upgraduje bez zálohy
+
+`server/migrate-from-crazymax.sh:965-973`, `README.md:130-133`, `MIGRATION.md:139-141`.
+
+Po úspěchu ukazuje `.env` na plovoucí řady (`matomo:5`, `redis:8-alpine`, `crazymax/msmtpd:latest`, `mariadb:10.x`), kontejnery dál běží na starých image ID. Skripty dávají `--pull never`. Ruční postup v README (`docker compose up -d` po změně tagu) a dokončení po výpadku proudu v `MIGRATION.md` ne. U `:latest` Compose při výchozí `pull_policy: missing` stáhne nový obraz. Redis 4 se vymění za 8, MariaDB se může recreate s `MARIADB_AUTO_UPGRADE=1`, a timerová záloha se nebere.
+
+Ověření: po úspěšné migraci porovnat `docker inspect --format '{{.Image}}'` db/redis s `docker compose config --images`. Pak `docker compose up -d` bez `--pull never` a totéž porovnání znovu.
+
+Oprava: v README i v MIGRATION.md dát `--pull never`, dokud upgrade nedělá `matomo-update.sh`. Do komentáře v `.env` napsat, že soubor je záměrně napřed před běžícími kontejnery.
+
+### 10. Minor / nit
+
+- **Nit.** `server/matomo-update.sh:438` loguje `database and config are in the pre-update state` i ve větvi `db_unchanged`, kde databáze právě obsahuje novější tracking.
+- **Minor.** Selhání dumpu nechá `*.sql.gz.partial` ležet (`matomo-update.sh:297`, migrace `745-754`). Při plném disku ten soubor brání opravenému opakování.
+- **Minor.** QueuedTracking se kontroluje jen při migraci. Mezi ní a prvním během timeru plugin někdo zapne, Redis se v tom běhu mění z 4 na 8 a fronta v paměti zmizí. Update skript plugin nečte.
+- **Minor.** Obraz bez `RepoDigests` (lokální build, některý `docker load`) migrace odmítne, i když `OLD_IMAGE_ID` zná a šel by přetagovat na lokální ref. Fail-closed, ale pin jde udělat i bez registru (`migrate-from-crazymax.sh:218-226`, `437-441`).
+
+## Dřívější nálezy
+
+1. **Vyřešeno.** Všechna `up` ve skriptech mají `--pull never`, rollback dělá `docker tag` na uložené image ID. Test to u šesti služeb porovnává.
+2. **Částečně.** Přepnutí samotné MariaDB neupgraduje (pin digestu, v testu stejné image ID db). Fyzická kopie datadiru pořád není. Upgrade i jeho nezvratitelnost se přesunuly do timeru, viz bod 7.
+3. **Vyřešeno.** `/matomo.php` prázdným GET je 200 a nejde přes `trusted_hosts` ani `force_ssl`. Výjimka je 503 při vypnutém trackování, bod 2.
+4. **Vyřešeno.** Cron v migraci startuje až po `verify`. `config-main` při pádu `core:update` skončí 1 a s6 to díky `if` a `S6_BEHAVIOUR_IF_STAGE2_FAILS=2` nenechá projet. Verify je druhá pojistka.
+5. **Částečně.** Trap EXIT/INT/TERM/HUP je. Systemd timeout rollback pořád usekne, bod 6.
+6. **Částečně.** Nově založený `NEW_DIR` a dry-run adresář se mažou, cizí `:latest` tagy dry-run netahá. Existující prázdný `NEW_DIR` ne, bod 4. Hláška „nic se nezměnilo“ zůstala.
+7. **Částečně.** Místo se kontroluje a dump jde přes `.partial`. Mez je `data_length + index_length`, ne velikost SQL dumpu (komprimované archivy se v dumpu nafouknou a gzip je nesrazí). Stejný filesystem jen varuje. Update skript navíc nehlásí non-InnoDB tabulky, migrace ano.
+8. **Vyřešeno.** Sítě, labely, `container_name`, command/entrypoint, volumes u redis/msmtpd, QueuedTracking a jiný příkaz db migraci zastaví. Redis se při přepnutí nemění za 8.
+9. **Částečně.** Jiný `COMPOSE_DIR` se odmítne. Stejný adresář nechá staré `HEALTH_URL`, `BACKUP_DIR` i chybějící nové klíče.
+10. **Vyřešeno.** Oba skripty vyžadují `WAIT_TIMEOUT_SECONDS` delší než `MATOMO_START_PERIOD`.
+11. **Částečně.** Rollback teď hlídá image ID všech služeb a obnovu po `DROP` marker tabulky. Nainstalované Matomo a skutečný `core:update` v testu pořád nejsou, takže body 1 a 7 by zelený běh nechytil.
+12. **Vyřešeno.** Neprázdný `_old_` se jen zaloguje.
+13. **Vyřešeno.** `config/` se odsouvá stranou a rozbalí z archivu jako celek.
+14. **Nevyřešeno.** Pořád stačí jedna `CREATE TABLE` a heslo z `config.ini.php` se s `MYSQL_PASSWORD` neporovnává. Dokumentace se snížila na úroveň skriptu.
+15. **Částečně.** `MIGRATION.md` už říká, že migrace schématu výpadek protáhne. `README.md:89` pořád slibuje obvykle minutu a 31 s je běh bez instalace.
+16. **Vyřešeno.** Port kontejneru a souboru se porovnají, neshoda migraci zastaví.
+
+--- Iteration 2: Evaluation ---
+Independent verification before accepting:
+- mawk exponent output: confirmed (ubuntu:22.04, mawk 1.3.4 20200120 prints 3.14573e+09; bash `if ((free < need))` then errors and continues).
+- Missing tag error text: confirmed ("failed to resolve reference ...: not found").
+- mariadb-dump/mariadb-admin: present in mariadb:10.4, missing in 10.3 and 10.2 (Grok's "since 10.5" was wrong, the gap is real for <10.4).
+  Also found: compose.yml db healthcheck used mariadb-admin without fallback (not reported by either reviewer).
+- Password in config.ini.php was not compared: confirmed.
+Accepted and fixed (da0c298, e787869):
+- C1/G1 fingerprint false match -> restore always on Matomo version change; fingerprint + indexes, only archive_numeric/blob excluded; failed fingerprint -> restore (kept, integrity over a few visits; Grok's "failure must not restore" rejected).
+- C3/G6 systemd 90 s stop timeout -> TimeoutStopSec=2h, signals ignored in rollback.
+- C4 shared reference with different image IDs -> refused in both scripts.
+- C5 mawk -> integer free-space check, fail closed.
+- C6 .env "KEY = value" -> dotenv_keys.
+- C7 install-timer keeps old timeout -> existing config of the same stack is updated.
+- C8/G5 finalize_env partial + exit 1 -> atomic .env, exit 3 after the switch.
+- C9/G4 existing empty NEW_DIR / backup-phase signal -> cleanup_new_dir.
+- C2 indented QueuedTracking line -> INI readers accept indentation.
+- G3 pull error treated as missing tag -> classified; same version via tracked label.
+- G8 update dump without mysqldump fallback -> shared DB_DUMP_SNIPPET.
+- G9 plain `docker compose up -d` after migration -> documented, comment in .env.
+- Nits: db_unchanged/restore_succeeded log wording, .partial removed on failure, README downtime wording.
+Rejected / deferred:
+- G2 curl --retry-all-errors on curl < 7.71: Ubuntu 20.04 is EOL; not changed.
+- G2 record_statistics=0 -> 503: deliberate setting, documented as limitation in the report.
+- G7 rollback across MariaDB minor lines: timer tracks mariadb:major.minor (patch only); documented as manual step.
+- G10 QueuedTracking in update script: open item.
+- G10 images without RepoDigests: fail-closed by design.
+- Old #7 dump size vs data_length: estimate kept (gzip output is smaller than data+index in practice); noted as uncertainty.
+
+--- Iteration 3: Prompt ---
+Posuď kriticky RE-CHECK (3. a poslední kolo). Nehledej potvrzení, hledej chyby.
+
+Kontext: migrační skript server/migrate-from-crazymax.sh a server/matomo-update.sh v tomto repozitáři. Ve 2. kole (ty a druhý nezávislý reviewer) vznikly nálezy; opravy jsou v commitech 4d73952..HEAD (da0c298, e787869).
+
+Shrnutí oprav 2. kola:
+1. Pravidlo obnovy DB při rollbacku (server/lib/db.sh db_restore_needed): dump se obnoví VŽDY, když se změnila verze Matomo (migrace = SAME_MATOMO_VERSION=false; update = label org.opencontainers.image.version starého vs nového obrazu, chybějící label = změna); při stejné verzi jen když se fingerprint liší nebo ho nejde spočítat. Fingerprint nově zahrnuje indexy (information_schema.statistics) a vylučuje jen archive_numeric_* / archive_blob_* (archive_invalidations se počítá).
+2. rollback() v obou skriptech: trap '' INT TERM HUP; systemd unit TimeoutStopSec=2h.
+3. Kontrola místa: server/lib/host.sh free_bytes/has_enough_space – celočíselně v bashi, fail closed (mawk na Ubuntu 22.04 tiskne 3.14573e+09 – ověřeno).
+4. Odmítnutí služeb se sdíleným image reference, ale různým image ID (migrace preflight i update collect_state).
+5. select_matomo_image: chyba pullu jiná než "tag neexistuje" (manifest unknown / ": not found") = pull_failed; pokud sledovaný obraz má stejnou verzi jako běžící, SAME_MATOMO_VERSION=true.
+6. finalize_env: celý .env se sestaví vedle, ověří (compose --env-file) a přejmenuje; selhání po přepnutí = exit 3 (EXIT trap ve fázi switched převádí jiné nenulové kódy na 3).
+7. cleanup_new_dir: předem existující prázdný NEW_DIR se vyprázdní; úklid i při přerušení ve fázi backup.
+8. Sdílený DB_DUMP_SNIPPET s fallbackem na mysqldump (MariaDB < 10.4 nemá mariadb-dump – ověřeno na mariadb:10.3); db healthcheck v compose.yml s fallbackem na mysqladmin.
+9. Kontrola hesla config.ini.php proti MYSQL_PASSWORD; INI s odsazením; .env klíče ve tvaru "KEY = value" / "export KEY=" při čištění prostředí.
+10. install-timer.sh: existující config stejného stacku dostane 4 nové hodnoty, ostatní zachová, nové klíče z example doplní (atomicky).
+11. Dokumentace: pravidlo obnovy, po migraci nasazovat přes systemctl start matomo-update.service (ne holé docker compose up -d), exit kód 3, downtime.
+
+Zamítnuto/odloženo (není třeba znovu hlásit, pokud nemáš nový argument): curl --retry-all-errors (curl < 7.71, Ubuntu 20.04 EOL), record_statistics=0 → 503 (vědomé nastavení), obraz bez RepoDigests (fail-closed záměrně), downgrade MariaDB napříč minor řadou (timer sleduje mariadb:major.minor, změna řady je ruční krok – zdokumentováno), QueuedTracking v update skriptu (otevřený bod), test s nainstalovaným Matomo a reálným core:update (otevřený bod).
+
+Úkol:
+- U každé opravy 1–11: vyřešeno / částečně / nevyřešeno + proč (stručně).
+- Najdi NOVÉ chyby zavedené těmito opravami (regrese, edge cases: set -e v trapech, exit v EXIT trapu, find -delete, --env-file, $$ v compose healthcheck, printf %q a sourcing, label chybějící u starých obrazů, atd.).
+- U každého nálezu: závažnost (blocker/major/minor/nit), soubor:řádek, scénář, jak ověřit, oprava.
+Nepiš do souborů, jen čti. Odpověz česky, seřazeno od nejzávažnějšího.
+(Grok: same prompt plus the no-shell note and the prepared diff file fixes3.diff)
+
+--- Iteration 3: Codex ---
+**RE-CHECK neuzavírám jako čistý.** Našel jsem tři nálezy závažnosti major a čtyři minor. Dva představují nedokončené opravy, ostatní jsou regrese přidaných změn. Blocker jsem nedoložil.
+
+Kontrolován rozsah `4d73952..e787869`. Soubory jsem neměnil.
+
+1. **Major — kontrola sdílených obrazů nerozpozná aliasy stejného tagu.**  
+   [server/lib/host.sh:36](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/lib/host.sh:36>), volání v migraci `:449` a update `:224`. **Nedokončená oprava 4.**
+
+   **Scénář:** `matomo` používá `crazymax/matomo`, cron `docker.io/crazymax/matomo:latest`, ale běží na různých image ID. Kontrola porovnává řetězce, takže konflikt neohlásí. Rollback přetaguje tentýž tag dvakrát; druhé přetagování přepíše první a původní kombinaci obrazů neobnoví. Tyto zápisy jsou podle [Docker dokumentace](https://docs.docker.com/reference/cli/docker/image/tag/) ekvivalentní.
+
+   **Ověření:** skutečné `docker compose config --format json` zachovalo oba odlišné zápisy. Helper nad vstupem níže nevypsal konflikt:
+   ```text
+   matomo crazymax/matomo sha256:old
+   cron docker.io/crazymax/matomo:latest sha256:new
+   ```
+   **Oprava:** před porovnáním kanonizovat reference podle Docker pravidel, včetně implicitního registry, namespace a tagu.
+
+2. **Major — přeinstalování timeru zahazuje vlastní nastavení mimo example.**  
+   [server/install-timer.sh:50](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/install-timer.sh:50>), zejména smyčka končící na `:59` a nahrazení konfigurace na `:117`. **Regrese opravy 10.**
+
+   **Scénář:** existující konfigurace obsahuje například `DOCKER_HOST=unix:///run/user/1000/docker.sock`. Update ji díky `set -a; source …` dosud exportoval Docker klientovi. Nový `render_config` vypisuje pouze klíče z example, takže `DOCKER_HOST` zmizí. Následující update může kontaktovat jiný daemon nebo přestat fungovat. Totéž platí pro `DOCKER_CONTEXT`, proxy či vlastní nastavení certifikátů.
+
+   **Ověření:** do testovací existující konfigurace přidat `DOCKER_HOST`, zavolat `render_config` a ověřit jeho přítomnost ve výsledku. Ze smyčky je patrné, že se nevypíše; tuto reprodukci jsem zde nespouštěl.
+
+   **Oprava:** zachovat existující konfiguraci, cíleně nahradit čtyři předané hodnoty a doplnit chybějící klíče example. Nestačí rekonstruovat soubor pouze podle example.
+
+3. **Major — kontrola hesla odmítá běžná platná hesla Matomo.**  
+   [server/migrate-from-crazymax.sh:576](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/migrate-from-crazymax.sh:576>), parser [server/lib/matomo-config.sh:16](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/lib/matomo-config.sh:16>). **Regrese opravy 9.**
+
+   **Scénář:** skutečné heslo je `p$ss&word`. Matomo je standardně uloží jako `p&#36;ss&amp;word`. `ini_value` pouze odstraní uvozovky, proto nové porovnání skončí `credentials_mismatch`, přestože obě služby mají stejné funkční heslo. Kódování a dekódování potvrzuje [Matomo IniFileChain](https://raw.githubusercontent.com/matomo-org/matomo/5.x-dev/core/Config/IniFileChain.php).
+
+   **Ověření:** reprodukováno bez souboru:
+   ```bash
+   printf '%s\n' '[database]' 'password = "p&#36;ss&amp;word"' |
+     ini_value /dev/stdin database password
+   ```
+   Výsledek obsahuje entity, nikoli skutečné heslo.
+
+   **Oprava:** číst efektivní konfiguraci přes Matomo PHP konfiguraci v běžícím kontejneru. Heslo při porovnání nevypisovat do logu.
+
+4. **Minor — fingerprint stále přehlédne změnu typu indexu.**  
+   [server/lib/db.sh:67](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/lib/db.sh:67>). **Nedokončená oprava 1.**
+
+   **Scénář:** při stejné verzi Matomo plugin změní index z BTREE na FULLTEXT a selže před aktualizací `version_*`. Hashované položky nezahrnují `INDEX_TYPE`, takže rollback může ponechat změněnou DB.
+
+   **Ověření na testovací MariaDB:** porovnat fingerprint před a po:
+   ```sql
+   CREATE TABLE matomo_probe (s VARCHAR(100), KEY k(s)) ENGINE=InnoDB;
+   ALTER TABLE matomo_probe DROP INDEX k, ADD FULLTEXT INDEX k(s);
+   ```
+   Hashované vlastnosti indexu zůstávají stejné. SQL reproduktor jsem nespouštěl; závěr vychází z dotazu a [definice STATISTICS](https://mariadb.com/docs/server/reference/system-tables/information-schema/information-schema-tables/information-schema-statistics-table).
+
+   **Oprava:** zahrnout alespoň `INDEX_TYPE` a `COLLATION`. Další atributy přidávat s ohledem na podporu starších MariaDB.
+
+5. **Minor — selhání logování obejde slíbený exit 3.**  
+   [server/migrate-from-crazymax.sh:959](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/migrate-from-crazymax.sh:959>) a `:1036`. **Regrese opravy 6.**
+
+   **Scénář:** po přepnutí se zaplní disk nebo přestane být zapisovatelný log. `finish_fail` zavolá `log`; kvůli `set -e` skončí před `exit 3`. EXIT trap následně selže stejným způsobem při svém logování. Skript vrátí **1**, přestože nový stack běží.
+
+   **Ověření:** reprodukováno s extrahovanými skutečnými funkcemi, `set -e`, `PHASE=switched` a `log() { return 1; }`. Výsledný status byl 1 místo 3.
+
+   **Oprava:** v obou ukončovacích větvích chránit diagnostické logování pomocí `|| true`; explicitní výsledný status musí být nezávislý na loggeru.
+
+6. **Minor — chybějící klíč konfigurace může být převzat z prostředí instalátoru.**  
+   [server/install-timer.sh:35](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/server/install-timer.sh:35>). **Regrese opravy 10.**
+
+   **Scénář:** starý config neobsahuje nově přidaný klíč, ale stejnojmenná proměnná existuje v prostředí. `config_value` ji před `source` neodstraní, proto ji považuje za hodnotu ze souboru. Místo hodnoty example ji trvale zapíše do konfigurace.
+
+   **Ověření:** skutečná funkce při `HEALTH_RETRIES=777; config_value /dev/null HEALTH_RETRIES` vrátila `777` se statusem 0, ačkoli soubor nic nenastavil.
+
+   **Oprava:** před načtením odstranit hledanou proměnnou; ideálně načítat konfiguraci jednou v izolovaném prostředí a rozlišovat hodnoty skutečně definované souborem.
+
+7. **Minor — dokumentace podhodnocuje ztrátu dat při obnově.**  
+   [README.md:131](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/README.md:131>), obdobně [MIGRATION.md:144](</Users/michalblaha/Documents/Dev/Dev Projects/hs-matomo/MIGRATION.md:144>). **Regrese dokumentace v opravě 11.**
+
+   **Scénář:** dump velké DB trvá desítky minut. Tracking během zálohování běží; snapshot pochází ze začátku dumpu. Povinná obnova po neúspěšném upgradu zahodí i návštěvy z tohoto intervalu. Tvrzení, že tracking byl během ztraceného období stejně vypnutý, tedy neplatí.
+
+   **Ověření:** `create_backup` předchází `apply_update`; migrace před dumpem zastavuje pouze cron. Web během dumpu přijímá požadavky.
+
+   **Oprava:** uvést, že ztracené období začíná okamžikem snapshotu a může zahrnovat celé zálohování i následné přepnutí.
+
+**Stav oprav 1–11:**
+
+| Oprava | Verdikt | Proč |
+|---|---|---|
+| 1. Obnova DB a fingerprint | **Částečně** | Rozhodovací pravidlo i chybějící label jsou správně; indexový fingerprint má mezeru z nálezu 4. |
+| 2. Signály a systemd timeout | **Vyřešeno** | Ignorování signálů je zapojené, `TimeoutStopSec=2h` nastavený. Nejde samozřejmě o ochranu proti SIGKILL. |
+| 3. Volné místo | **Vyřešeno** | Celočíselný výpočet odstranil problém s exponentem; neplatné měření vede k odmítnutí. |
+| 4. Sdílené reference | **Částečně** | Funguje pro totožné řetězce, ne pro ekvivalentní Docker reference. |
+| 5. Výběr Matomo image | **Vyřešeno** | Rozlišení chyby pullu i nastavení stejné verze odpovídají popisu. |
+| 6. Atomické `.env`, exit 3 | **Částečně** | Sestavení, validace přes `--env-file` a rename jsou správně; logger může obejít exit 3. |
+| 7. Úklid NEW_DIR | **Vyřešeno** | Pokrývá existující prázdný adresář i fázi backup. U `find -delete` jsem nedoložil novou chybu. |
+| 8. Starší MariaDB | **Vyřešeno** | Fallback dumpu i healthchecku je správně; `$$admin` správně odkládá expanzi do kontejneru. |
+| 9. Heslo, INI, dotenv | **Částečně** | Odsazení a dotenv klíče opravené; porovnání hesla neodpovídá kódování Matomo. |
+| 10. Instalace timeru | **Částečně** | Čtyři hodnoty přepisuje atomicky, ale ostatní nastavení nezachovává úplně a může převzít okolní prostředí. |
+| 11. Dokumentace | **Částečně** | Nasazování přes systemd, exit 3 a downtime doplněny; popis ztraceného trackingového období je chybný. |
+
+Ověřil jsem syntaxi skriptů, malé shellové reprodukce a skutečné parsování Compose konfigurace. Plný Bats ani integrační běh s MariaDB/systemd neproběhl. Samotné `printf %q` se sourcingem ani samotný `exit` uvnitř EXIT trapu jsem jako chybu nepotvrdil.
+--- Iteration 3: Grok ---
+Třetí kolo beru jako hledání regresí v opravách, ne jako potvrzení. Nejdřív si přečtu diff a aktuální skripty.Diff je jen polovina obrazu. Teď čtu samotné funkce, které ty opravy mění — hlavně rollback, trap, env a výběr obrazu.Opravy 1, 3, 4, 5 a 8 sedí. Nevyřešený je štít signálů kolem rollbacku: shell signál spolkne, `docker` uprostřed obnovy dumpu ne. Dump má `--add-drop-database`, takže přerušení nechá živou databázi v půlce.
+
+## Nálezy
+
+### 1. Major: `trap ''` rollback neochrání
+
+`server/migrate-from-crazymax.sh:896`, `server/matomo-update.sh:471`, obnova `migrate-from-crazymax.sh:922` a `matomo-update.sh:439`, unit `server/systemd/matomo-update.service:10-18` (chybí `KillMode`).
+
+`trap '' INT TERM HUP` nastaví ignorování jen v shellu. Děti ho zdědí, ale `docker` (Go) volá `signal.Notify` na SIGINT/SIGTERM a tím ignorování přepíše. `gzip` signál nepřevezme.
+
+Scénář: rollback už pouští `gzip -dc dump | docker compose exec … mysql`. Operátor dá Ctrl+C, spadne SSH se SIGHUP jen pokud ho docker chytá, nebo `systemctl stop` / druhý timeout. Systemd má výchozí `KillMode=control-group`, takže SIGTERM jde celé cgroup, nejen shellu. `docker compose exec` skončí, klient v kontejneru dostane EOF. Dump stihl `DROP DATABASE` a část `CREATE`/`INSERT`. Skript to pozná (`pipefail`, `exit 2` / `exit 1`) a starý Matomo nespustí, ale kontejner databáze běží s nekompletní schématem. Soubor dumpu na disku zůstává.
+
+`TimeoutStopSec=2h` pomůže jen procesu, který SIGTERM ignoruje. První timeout (běží update, rollback ještě nezačal) je v pořádku: SIGTERM přijde jednou, nové děti vzniknou až potom. Řeže se až signál během obnovy.
+
+Ověření: v jednotce se `KillMode=control-group` spustit `trap '' TERM; docker run --rm alpine sleep 60` a `systemctl stop`. Kontejner skončí hned, ne až po `TimeoutStopSec`. Totéž pro migraci: rollback na velkém dumpu, jeden Ctrl+C, v DB chybí část tabulek a v logu je `database restore failed`.
+
+Úprava: do jednotky `KillMode=mixed` (SIGTERM jen hlavnímu procesu, který ho ignoruje; SIGKILL po `TimeoutStopSec` zůstává). V migraci pustit stranu s Dockerem přes `setsid`, ať není ve foreground group terminálu. `TimeoutStopSec=2h` je pořád strop: obnova větší než 2 h dostane SIGKILL v téže díře, na velkou databázi ho nestačí natvrdo.
+
+### 2. Minor: heslo z INI se neodeescapuje
+
+`server/lib/matomo-config.sh:16`, porovnání `server/migrate-from-crazymax.sh:568-577`.
+
+Matomo (`IniWriter::encodeValue`) píše řetězce jako `"…"` a `addcslashes($value, '\\"')`. Čtečka to vrací zpět. `ini_value` sundá jen obalové uvozovky.
+
+Scénář: heslo `a\b` nebo `a"b` je v `config.ini.php` jako `"a\\b"` / `"a\"b"`. Kontejner má surové heslo, Matomo se připojuje. Skript skončí `credentials_mismatch` a migrace se nespustí. Hesla bez `\` a `"` projdou. Odsazení a `[database]` sedí.
+
+Ověření: INI `password = "a\\b"` a `MYSQL_PASSWORD=a\b`. `ini_value` vrátí `a\\b`, porovnání selže.
+
+Úprava: po sundání uvozovek projet escape jako IniReader (`\\` → `\`, `\"` → `"`), ne globálně `gsub`.
+
+### 3. Minor: dočasný `.env` s heslem zůstane
+
+`server/migrate-from-crazymax.sh:1016-1027`, `finish_fail` na `1035-1037`.
+
+`mktemp` v `NEW_DIR` dostane celý `.env` včetně `MYSQL_PASSWORD`. Při selhání `set_env_file_value`, `compose --env-file` nebo `mv` jde `finish_fail` → `exit 3` a soubor `.env.final.*` (mode 600) se nemaže. Původní `.env` se nepřepíše, to je v pořádku. Vedle něj zůstane druhá kopie hesel. EXIT trap ve fázi `switched` při jiném kódu než 0/3 soubor taky neuklidí.
+
+Ověření: `FINAL_IMAGES` s apostrofem (test v `migrate.bats` čeká exit 3) a `ls -a "$NEW_DIR"`. Má zbýt `.env.final.*`.
+
+Úprava: `trap 'rm -f "$tmp"' RETURN` ve `finalize_env`, mazat i v `finish_fail`.
+
+### 4. Minor: `config_value` dědí prostředí
+
+`server/install-timer.sh:33-39`, volání na `54`.
+
+Subshell udělá `source` a `${!2+set}` je pravda i když klíč nastavil rodič, ne soubor. Klíč, který v souboru je, source přepíše. Díra je klíč v example, který ve starém souboru není.
+
+Scénář: starý `/etc/matomo-update/matomo-update.env` nemá `IMAGE_PRUNE_UNTIL`. Root má v prostředí `IMAGE_PRUNE_UNTIL=1h`. `install-timer.sh` stejného stacku zapíše `1h` místo `168h` z example. Jiný klíč se chová stejně (`LOG_FILE`, `STATE_DIR`, `BACKUP_RETENTION_DAYS`, …). Čtyři argumenty z CLI tím neprocházejí.
+
+Soubor, který nejde sourceovat, skript odmítne dřív (`configured_compose_dir` vrátí prázdno). Tiché shození existujících klíčů při syntax error tedy není.
+
+Ověření: soubor bez `IMAGE_PRUNE_UNTIL`, `IMAGE_PRUNE_UNTIL=1h install-timer.sh …`, v novém souboru je `1h`.
+
+Úprava: před `source` `unset -v "$2"`. Stejný vzor je v `configured_compose_dir` (`86-92`): soubor bez `COMPOSE_DIR` a proměnná v prostředí projde kontrolou „stejný stack“.
+
+Klíče, které v example nejsou, přepis smaže. `render_config` jde po řádcích example, ne starého souboru.
+
+### 5. Minor: sdílený obraz končí exit 1
+
+`server/matomo-update.sh:227-230`.
+
+Kontrola v `collect_state` je před backupem i výměnou kontejnerů. Stejná třída chyb („service not found“) končí exit 2. Tady je exit 1, tedy „update failed“ v tabulce v README. Timer hlásí selhání nasazení, ačkoli se nic nezměnilo.
+
+Ověření: dva servisy se stejnou referencí a jiným ID, `echo $?` je 1 a v logu není `rollback_started`.
+
+Úprava: `exit 2`.
+
+### 6. Minor: dokumentace víc slibuje, než kód dělá
+
+`MIGRATION.md:161-162`, `README.md:87-88` a `132-133`.
+
+Návrat po výpadku napájení pořád říká `docker compose up -d` v `OLD_DIR`. Vedlejší věta pro dokončení v `NEW_DIR` už má `--pull never`. Bez něj tag, který se mezitím pohnul, stáhne obraz bez zálohy. To je přesně důvod, proč skripty jedou s `--pull never`.
+
+README: „The switch keeps all software versions (database untouched)“. To platí jen když existuje obraz stejné verze. Když pull vrátí „tag neexistuje“, přepnutí Matomo povýší a migrace databáze běží. `MIGRATION.md` to popisuje, README ne.
+
+Věta, že skript při rollbacku ignoruje další signály, je bod 1.
+
+Úprava: i cesta zpět `--pull never`. V README napsat, že při chybějícím tagu stejné verze se Matomo povyšuje už při přepnutí.
+
+### 7. Minor: prázdný dump nechá `.partial`
+
+`server/migrate-from-crazymax.sh:781-790`.
+
+Nové `rm -f "$partial"` je jen ve větvi, kde selže dump, `gzip -t` nebo patička. Když je Matomo nainstalované a v dumpu není žádné `CREATE TABLE`, funkce vrátí 1 a `.sql.gz.partial` nechá. Kontrola hesla tuhle větev zužuje, nemazání v ní zůstalo.
+
+Ověření: dump s `-- Dump completed` a bez `CREATE TABLE`. Soubor `*.partial` zůstane v `BACKUP_DIR`.
+
+Úprava: `rm -f "$partial"` i v téhle větvi.
+
+### 8. Nit
+
+`server/lib/db.sh:4-7` pořád říká, že se dump vrací jen při změně struktury. `db_restore_needed` (`40-44`) vrací dump i při změně verze. Komentář vede k opačné úpravě.
+
+`server/lib/db.sh:67-71`: fingerprint indexu nemá `index_type` ani `collation` (A/D). Stejná verze Matomo, která jen otočí směr indexu, se tváří jako beze změny schématu a dump se nevrátí. Security rebuild to nedělá. Doplnit oba sloupce do `GROUP_CONCAT`.
+
+Test `finalize_env` v `test/unit/migrate.bats:301` nahrazuje `docker` za `return 0`. Neověří, že `compose --env-file` čte dočasný soubor. Podle aktuální dokumentace Compose `--env-file` výchozí `.env` nahrazuje (Engine 25, který migrace vyžaduje), takže samotná validace je v pořádku.
+
+## Opravy 1–11
+
+| # | Stav | Proč |
+|---|---|---|
+| 1 | vyřešeno | `db_restore_needed`: jiná verze vždy; stejná verze jen při rozdílu nebo prázdném fingerprintu. Update bere label aplikace, chybějící label = změna. Indexy jsou ve fingerprintu, `archive_invalidations` není vyřazená. Díra je jen typ a směr indexu (nit 8). |
+| 2 | částečně | `TimeoutStopSec=2h` dává čas do SIGKILL. `trap ''` nechrání `docker` (nález 1). První timeout uprostřed updatu rollback neseřízne, signál během obnovy ano. |
+| 3 | vyřešeno | `df` jen číslo v KB, násobení v bashi, nečíselný vstup i málo místa fail-closed. Volání je v `if`, takže `(( ))` při nedostatku místa skript neshodí. |
+| 4 | vyřešeno | Stejná reference a jiné ID v preflightu migrace i v `collect_state`. Prázdné ID update přeskočí; migrace ho nepotká, protože servis musí běžet. |
+| 5 | vyřešeno | Jiná chyba pullu než `manifest unknown` / `: not found` je `pull_failed`. Chybějící tag spadne na sledovaný obraz; stejný label nastaví `SAME_MATOMO_VERSION`. |
+| 6 | vyřešeno | `.env` se skládá vedle, `compose --env-file` ho ověří, pak `mv`. Po přepnutí jiný kód než 0 a 3 skončí jako 3. Vedlejší soubor s heslem se nemaže (nález 3). |
+| 7 | vyřešeno | Prázdný existující `NEW_DIR` se vyprazdňuje, nový se maže, fáze `backup` uklízí taky. `find -delete` nejde do symlinků. Smazat nejde jen to, co nejde smazat; pak další běh skončí na „NEW_DIR is not empty“. |
+| 8 | vyřešeno | `DB_DUMP_SNIPPET` padá na `mysqldump`. V healthchecku je `$$`, Compose z toho udělá `$admin`, větev `\|\|` vybere `mysqladmin`. |
+| 9 | částečně | Odsazení, `export` / mezery kolem `=` a `MATOMO_START_PERIOD` sedí. Heslo s `\` nebo `"` migraci falešně odmítne (nález 2). |
+| 10 | vyřešeno | Stejný stack: čtyři argumenty se přepíšou, ostatní klíče z example zůstanou, nové přijdou z example, zápis je přes `mktemp` + `mv` + kontrolu `COMPOSE_DIR`. Dědictví prostředí a klíče mimo example jsou nález 4. |
+| 11 | částečně | Pravidlo obnovy, `systemctl start`, exit 3 a downtime v `MIGRATION.md` odpovídají kódu. README pořád tvrdí, že se databáze při přepnutí nehýbe, návrat po výpadku napájení je bez `--pull never`, věta o ignorování signálů neplatí (nálezy 1 a 6). |
+
+--- Iteration 3: Evaluation ---
+Accepted and fixed in ae28a79 (CI green: lint-test, integration, migration, build):
+- C1 reference aliases bypass the shared-image check -> normalize_reference (docker.io, library/, :latest).
+- G1 `trap ''` does not protect docker children (Go CLI re-enables signals via signal.Notify; systemd control-group kill)
+  -> KillMode=mixed in the unit, DB restore runs under setsid in both scripts.
+- C3/G2 password comparison rejects valid encoded passwords -> comparison removed (running Matomo proves the
+  connection; host/user/dbname still checked). Header updated.
+- C4/G8 index type/collation -> added to the fingerprint.
+- C5 logger failure bypasses exit 3 -> `|| true` around logging in finish paths.
+- G3 temporary .env copy with password left behind -> removed in finish_fail.
+- C2 install-timer drops settings outside the example -> carried over verbatim.
+- C6/G4 config_value / configured_compose_dir inherit the environment -> unset before source.
+- G5 shared-image conflict exit 1 -> exit 2 (configuration/environment).
+- G7 empty dump leaves .partial -> removed.
+- C7/G6/G8 docs: loss window starts at the dump snapshot; --pull never on the way back; README states the switch
+  upgrades Matomo when no same-version image exists; db.sh header matches db_restore_needed.
+Not changed:
+- G1 "TimeoutStopSec=2h is a hard cap": accepted limitation, documented in the unit; very large restores need a higher value.
+Iteration limit (3) reached; remaining open items go to the user.
