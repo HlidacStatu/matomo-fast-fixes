@@ -715,7 +715,7 @@ print_generated_env() {
 
 confirm() {
   $ASSUME_YES && return 0
-  [[ -r /dev/tty ]] || fail confirmation_required "no terminal to confirm on; use --yes"
+  { : </dev/tty; } 2>/dev/null || fail confirmation_required "no terminal to confirm on; use --yes"
   local answer
   read -r -p "Proceed with the switch (short downtime)? [y/N] " answer </dev/tty
   [[ $answer == y || $answer == Y || $answer == yes ]] || fail aborted "migration aborted by the user, nothing was changed"
