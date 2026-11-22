@@ -34,8 +34,8 @@
 #   1. checks (no downtime): all six services run (db, redis, msmtpd,
 #      geoip-updater, matomo, cron) with the default network, commands and no
 #      extra labels; services sharing an image reference run the same image;
-#      only bind mounts hold data; Matomo's config.ini.php uses
-#      the db service credentials; QueuedTracking is not active; the Matomo
+#      only bind mounts hold data; Matomo's config.ini.php uses the db
+#      service host, user and database; QueuedTracking is not active; the Matomo
 #      major version matches; Docker Engine is recent enough,
 #   2. generates NEW_DIR from the *running* containers (environment minus
 #      image defaults, bind mounts, published port), so env_file/environment/
@@ -106,7 +106,7 @@ CRAZYMAX_TZ_FALLBACK=UTC
 MATOMO_DEFAULT_TABLE_PREFIX=matomo_
 # Environment set by compose.yml itself, therefore not copied into env files.
 CRON_ONLY_KEYS=(TZ SIDECAR_CRON CRON_ARCHIVE ARCHIVE_OPTIONS)
-REQUIRED_COMMANDS=(docker jq curl gzip tar realpath)
+REQUIRED_COMMANDS=(docker jq curl gzip tar realpath setsid)
 
 ASSUME_YES=false
 DRY_RUN=false
@@ -129,6 +129,8 @@ DRY_RUN_DIR=""
 # NEW_DIR did not exist before (removed as a whole) / this run wrote into it.
 NEW_DIR_CREATED=false
 NEW_DIR_WRITTEN=false
+# Temporary file of finalize_env (removed when finishing fails).
+FINAL_ENV_TMP=""
 # idle | backup | switching | rolling_back | switched - drives the EXIT trap.
 PHASE=idle
 # Values written to .env for the switch.
@@ -561,11 +563,12 @@ inspect_old_stack() {
   local ini="$web_dir/config/config.ini.php"
   if [[ -f $ini ]] && grep -qE '^[[:space:]]*\[database\]' "$ini"; then
     MATOMO_INSTALLED=true
-    local host user dbname prefix password
+    # The password is not compared: Matomo encodes special characters in
+    # config.ini.php; the running Matomo already proves that it can connect.
+    local host user dbname prefix
     host=$(ini_value "$ini" database host)
     user=$(ini_value "$ini" database username)
     dbname=$(ini_value "$ini" database dbname)
-    password=$(ini_value "$ini" database password)
     prefix=$(ini_value "$ini" database tables_prefix)
     [[ -z $prefix ]] || TABLE_PREFIX=$prefix
     if [[ $host != db || $user != "${ENV_VALUES[MYSQL_USER]}" || $dbname != "${ENV_VALUES[MYSQL_DATABASE]}" ]]; then
@@ -573,8 +576,6 @@ inspect_old_stack() {
         ini_host "$host" ini_username "$user" ini_dbname "$dbname" \
         db_user "${ENV_VALUES[MYSQL_USER]}" db_database "${ENV_VALUES[MYSQL_DATABASE]}"
     fi
-    [[ $password == "${ENV_VALUES[MYSQL_PASSWORD]}" ]] ||
-      fail credentials_mismatch "the password in config.ini.php differs from the db service password"
 
     # Redis then holds unprocessed tracking requests; recreating the
     # container (no persistence in the crazymax setup) would drop them.
@@ -786,6 +787,7 @@ create_backup() {
   local tables
   tables=$(gzip -dc "$partial" | grep -c '^CREATE TABLE' || true)
   if $MATOMO_INSTALLED && ((tables == 0)); then
+    rm -f "$partial"
     log error backup_empty "Matomo is installed but the dump contains no tables"
     return 1
   fi
@@ -919,7 +921,10 @@ rollback() {
   else
     log warn db_restore "restoring the pre-migration dump (Matomo upgraded or schema changed); data tracked since the backup is discarded" \
       same_matomo_version "$SAME_MATOMO_VERSION" before "$PRE_DB_FINGERPRINT" after "$post"
-    if ! gzip -dc "$DB_BACKUP_FILE" | old_compose exec -T db sh -c "$DB_CLIENT_SNIPPET"; then
+    # setsid: the docker CLI installs its own signal handlers (it would not
+    # inherit the ignored signals), so keep it out of reach of a Ctrl+C.
+    if ! gzip -dc "$DB_BACKUP_FILE" |
+      (cd "$OLD_DIR" && clean_compose_environment && setsid docker compose -f "$OLD_COMPOSE" exec -T db sh -c "$DB_CLIENT_SNIPPET"); then
       log error rollback_failed "database restore failed" db_backup "$DB_BACKUP_FILE"
       exit 2
     fi
@@ -956,7 +961,7 @@ on_exit() {
       ;;
     switched)
       if [[ $status -ne 0 && $status -ne 3 ]]; then
-        log error finish_failed "the new stack runs, but the migration could not be finished" status "$status"
+        log error finish_failed "the new stack runs, but the migration could not be finished" status "$status" || true
         exit 3
       fi
       ;;
@@ -1014,6 +1019,8 @@ switch() {
 finalize_env() {
   local key tmp
   tmp=$(mktemp "$NEW_DIR/.env.final.XXXXXX") || finish_fail "cannot create a temporary .env"
+  # Holds the database password: removed by finish_fail on any error.
+  FINAL_ENV_TMP=$tmp
   {
     echo "# The image lines are the tracked releases. Until matomo-update.sh has run"
     echo "# (systemctl start matomo-update.service), the containers may still run the"
@@ -1026,6 +1033,7 @@ finalize_env() {
   done
   compose_in "$NEW_DIR" --env-file "$tmp" config --quiet || finish_fail "final .env is invalid" file "$tmp"
   mv "$tmp" "$NEW_DIR/.env" || finish_fail "cannot replace .env" file "$tmp"
+  FINAL_ENV_TMP=""
   log info env_finalized "new .env tracks the supported image lines" \
     matomo_image "${FINAL_IMAGES[MATOMO_IMAGE]}" mariadb_image "${FINAL_IMAGES[MARIADB_IMAGE]}"
 }
@@ -1033,7 +1041,9 @@ finalize_env() {
 # finish_fail EVENT_MESSAGE [K V]... - a step after the switch failed; the
 # new stack keeps running.
 finish_fail() {
-  log error finish_failed "$1" "${@:2}"
+  [[ -z $FINAL_ENV_TMP ]] || rm -f "$FINAL_ENV_TMP"
+  # The exit code must not depend on the logger (e.g. a full disk).
+  log error finish_failed "$1" "${@:2}" || true
   exit 3
 }
 

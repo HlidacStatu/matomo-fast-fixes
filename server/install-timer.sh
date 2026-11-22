@@ -5,7 +5,9 @@
 #     given values. An existing file is updated only when it points to the
 #     same COMPOSE_DIR (otherwise the script stops instead of silently leaving
 #     the timer bound to another stack): the four given values are replaced,
-#     its other values are kept and keys new in the example are added,
+#     its other values are kept, keys new in the example are added and
+#     settings that are not in the example (e.g. DOCKER_HOST) are carried
+#     over verbatim,
 #   - renders server/systemd/matomo-update.{service,timer} with the real path
 #     of this checkout into /etc/systemd/system,
 #   - enables and starts the timer and prints when it runs next.
@@ -32,6 +34,8 @@ die() {
 # subshell); fails when the file does not set it.
 config_value() {
   (
+    # Only what the file sets counts, not the installer's environment.
+    unset -v "$2"
     set +u
     # shellcheck disable=SC1090
     source "$1" >/dev/null 2>&1
@@ -57,6 +61,14 @@ render_config() {
       printf '%s\n' "$line"
     fi
   done <"$example"
+  [[ -f $existing ]] || return 0
+  local extra
+  extra=$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$existing" | while IFS= read -r line; do
+    grep -qE "^${line%%=*}=" "$example" || printf '%s\n' "$line"
+  done)
+  if [[ -n $extra ]]; then
+    printf '\n# Kept from the previous configuration (not in the example).\n%s\n' "$extra"
+  fi
 }
 
 # systemd_quote VALUE - a double-quoted systemd command line argument.
@@ -85,6 +97,7 @@ render_service() {
 # Prints COMPOSE_DIR of an existing config file (sourced in a subshell).
 configured_compose_dir() {
   (
+    unset -v COMPOSE_DIR
     set +u
     # shellcheck disable=SC1090
     source "$1" >/dev/null 2>&1

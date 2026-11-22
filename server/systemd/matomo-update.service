@@ -16,6 +16,10 @@ TimeoutStartSec=3h
 # and rolls back: restoring the dump and waiting for the old stack must fit
 # here (the default 90s would SIGKILL a rollback half way).
 TimeoutStopSec=2h
+# SIGTERM only to the script, which then rolls back while ignoring further
+# signals; its docker children would otherwise be terminated with it and cut
+# a database restore in half. SIGKILL after TimeoutStopSec still hits all.
+KillMode=mixed
 Nice=10
 # Backups and logs hold credentials.
 UMask=0077

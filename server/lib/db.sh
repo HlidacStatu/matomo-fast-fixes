@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Database helpers shared by the server scripts.
 #
-# A rollback restores the pre-update dump only when the update actually
-# changed the database structure. Restoring unconditionally would discard
-# every visit tracked between the backup and the rollback; when nothing was
-# migrated, the running database is already the correct state.
+# A rollback restores the pre-update dump when the Matomo version changed or
+# the database structure changed (db_restore_needed). Restoring
+# unconditionally would discard every visit tracked since the dump snapshot
+# also after a failed rebuild of the same Matomo version, where nothing was
+# migrated and the running database is already the correct state.
 #
 # The fingerprint covers what Matomo migrations change:
 #   - table and column definitions and indexes (only the monthly
@@ -64,8 +65,8 @@ SELECT MD5(CONCAT(
     FROM information_schema.columns
     WHERE table_schema = DATABASE() AND ${rotating}), ''),
   '#',
-  IFNULL((SELECT GROUP_CONCAT(CONCAT_WS(':', table_name, index_name, non_unique,
-        seq_in_index, column_name, IFNULL(sub_part, 'NULL'))
+  IFNULL((SELECT GROUP_CONCAT(CONCAT_WS(':', table_name, index_name, index_type, non_unique,
+        seq_in_index, column_name, IFNULL(collation, 'NULL'), IFNULL(sub_part, 'NULL'))
       ORDER BY table_name, index_name, seq_in_index SEPARATOR '|')
     FROM information_schema.statistics
     WHERE table_schema = DATABASE() AND ${rotating}), ''),

@@ -85,7 +85,10 @@ needed on the servers.
    this configuration from the running containers, keeps the data in place,
    moves the old files to `OLD_DIR/_old_`, rolls back automatically on
    failure and installs the timer from step 3. The switch keeps all software
-   versions (database untouched); the timer upgrades afterwards. Downtime is
+   versions when this repository publishes an image of the running Matomo
+   version (database untouched); otherwise it upgrades Matomo during the
+   switch, including database migrations. The timer upgrades afterwards.
+   Downtime is
    the recreation of the containers plus Matomo's start (31 s in the CI
    test with a fresh Matomo; longer with a large installed one). After the
    migration, deploy with `systemctl start matomo-update.service`, not with
@@ -127,8 +130,9 @@ Matomo version (its migrations may have changed data, or stopped before they
 touched the schema) or the schema fingerprint (tables, columns, indexes,
 recorded schema versions; see `server/lib/db.sh`). A rebuild of the same
 Matomo version (security patches) that fails keeps the live data. Only a
-restore discards the tracking data written between the backup and the
-rollback (typically a few minutes, while tracking was down anyway).
+restore discards the tracking data written since the dump snapshot: during
+the dump itself (Matomo keeps tracking meanwhile; minutes to tens of minutes
+on a large database) and until the rollback.
 The systemd unit gives a rollback `TimeoutStopSec` to finish when the run
 is stopped or times out, and the script ignores further signals meanwhile.
 MariaDB is tracked on its `major.minor` line, so the timer only applies

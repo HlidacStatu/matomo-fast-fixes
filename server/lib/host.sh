@@ -27,11 +27,37 @@ dotenv_keys() {
   sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*/\2/p' "$1"
 }
 
+# normalize_reference REF - Docker's canonical form of an image reference
+# (crazymax/matomo == docker.io/crazymax/matomo:latest, redis ==
+# docker.io/library/redis:latest), so that aliases compare equal.
+normalize_reference() {
+  local ref=$1 digest="" name first
+  if [[ $ref == *@* ]]; then
+    digest="@${ref#*@}"
+    ref=${ref%%@*}
+  fi
+  name=$ref
+  first=${name%%/*}
+  if [[ $name != */* || ($first != *.* && $first != *:* && $first != localhost) ]]; then
+    [[ $name == */* ]] || name="library/$name"
+    name="docker.io/$name"
+  fi
+  if [[ -z $digest && ${name##*/} != *:* ]]; then
+    name="$name:latest"
+  fi
+  printf '%s%s\n' "$name" "$digest"
+}
+
 # conflicting_shared_images - reads "SERVICE REFERENCE IMAGE_ID" lines and
-# prints every reference that services share while running different image
-# IDs. Re-tagging such a reference on rollback can restore only one of them.
+# prints every (normalized) reference that services share while running
+# different image IDs. Re-tagging such a reference on rollback can restore
+# only one of them.
 conflicting_shared_images() {
-  awk '{ if (($2 in id) && id[$2] != $3) bad[$2] = 1; id[$2] = $3 }
+  local svc ref id
+  while read -r svc ref id; do
+    [[ -n $svc ]] || continue
+    printf '%s %s %s\n' "$svc" "$(normalize_reference "$ref")" "$id"
+  done | awk '{ if (($2 in id) && id[$2] != $3) bad[$2] = 1; id[$2] = $3 }
     END { for (r in bad) print r }'
 }
 

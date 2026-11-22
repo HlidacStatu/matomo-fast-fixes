@@ -41,7 +41,7 @@ REQUIRED_CONFIG=(
   WAIT_TIMEOUT_SECONDS HEALTH_URL HEALTH_RETRIES HEALTH_TIMEOUT_SECONDS
   IMAGE_PRUNE_UNTIL
 )
-REQUIRED_COMMANDS=(docker jq flock gzip curl find)
+REQUIRED_COMMANDS=(docker jq flock gzip curl find setsid)
 # Standard OCI label set by the image build to the Matomo version.
 VERSION_LABEL=org.opencontainers.image.version
 
@@ -227,7 +227,7 @@ collect_state() {
   if [[ -n $conflicts ]]; then
     log error state_invalid "services sharing an image reference run different images; recreate them first" \
       images "$conflicts" hint "docker compose up -d --pull never --force-recreate"
-    exit 1
+    exit 2
   fi
   local required
   for required in "$APP_SERVICE" "$CRON_SERVICE" "$DB_SERVICE"; do
@@ -436,7 +436,9 @@ restore_backup() {
   if db_restore_needed "$PRE_DB_FINGERPRINT" "$post" "$same_version"; then
     log warn db_restore "restoring the dump (Matomo version or schema changed); data tracked since the backup is discarded" \
       matomo_from "$old_version" matomo_to "$new_version" before "$PRE_DB_FINGERPRINT" after "$post"
-    if ! gzip -dc "$DB_BACKUP_FILE" | docker compose exec -T "$DB_SERVICE" sh -c "$DB_CLIENT_SNIPPET"; then
+    # setsid: the docker CLI installs its own signal handlers (it would not
+    # inherit the ignored signals), so keep it out of reach of a Ctrl+C.
+    if ! gzip -dc "$DB_BACKUP_FILE" | setsid docker compose exec -T "$DB_SERVICE" sh -c "$DB_CLIENT_SNIPPET"; then
       log error restore_failed "database restore failed" file "$DB_BACKUP_FILE"
       return 1
     fi

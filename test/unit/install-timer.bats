@@ -46,6 +46,22 @@ setup() {
   )
 }
 
+@test "render_config keeps settings outside the example and ignores the environment" {
+  old="$BATS_TEST_TMPDIR/old.env"
+  printf '%s\n' 'COMPOSE_DIR=/opt/m' 'DOCKER_HOST=unix:///run/user/1000/docker.sock' >"$old"
+  file="$BATS_TEST_TMPDIR/new.env"
+  IMAGE_PRUNE_UNTIL=1h render_config "$SERVER_DIR/matomo-update.env.example" "$old" /opt/m /b http://x/ 4000 >"$file"
+  grep -qx 'DOCKER_HOST=unix:///run/user/1000/docker.sock' "$file"
+  [ "$(grep -E '^IMAGE_PRUNE_UNTIL=' "$file")" = "$(grep -E '^IMAGE_PRUNE_UNTIL=' "$SERVER_DIR/matomo-update.env.example")" ]
+  # COMPOSE_DIR from the environment does not count as the configured one
+  printf '%s\n' 'BACKUP_DIR=/b' >"$old"
+  [ -z "$(COMPOSE_DIR=/opt/m configured_compose_dir "$old")" ]
+}
+
+@test "the service unit only signals the script, not its docker children" {
+  grep -qx 'KillMode=mixed' "$SERVER_DIR/systemd/matomo-update.service"
+}
+
 @test "the service unit gives a rollback time to finish after SIGTERM" {
   grep -qE '^TimeoutStopSec=[1-9]' "$SERVER_DIR/systemd/matomo-update.service"
 }

@@ -133,16 +133,17 @@ warning in that case.
 
 **If step 6 or 7 fails, or the script is interrupted (Ctrl+C, SIGTERM, an
 unexpected error), it rolls back automatically.** Further signals are ignored
-while the rollback runs, so it is not cut off half way.
+while the rollback runs, and the database restore runs in its own session, so
+a Ctrl+C does not cut it off half way.
 
 1. It removes the new containers and verifies that none is left.
 2. It moves the files back from `_old_` and re-tags the old images.
 3. It starts the old database and decides whether to restore the dump,
-   discarding data tracked since the backup:
+   discarding data tracked since the dump snapshot (during the dump, which
+   can take tens of minutes on a large database, and until the rollback):
    - **always** when the switch upgraded Matomo: its migrations may have
      changed data, or stopped before they changed the schema, which a
-     fingerprint cannot see. Tracking was down during the switch anyway, so
-     little is lost;
+     fingerprint cannot see;
    - with the same Matomo version, only when the schema fingerprint (tables,
      columns, indexes, recorded schema versions) changed or cannot be read.
      Otherwise all data is kept.
@@ -159,7 +160,8 @@ which can take much longer on a large database.
 **Power loss during steps 6–7** is not recovered automatically. In that case:
 - `OLD_DIR/_old_` and `NEW_DIR/migration.log` show how far the migration got.
 - To go back, move the files from `_old_` to `OLD_DIR`, then run
-  `docker compose up -d` there.
+  `docker compose up -d --pull never` there (a pull could bring a newer
+  image of a moved tag without a backup).
 - To finish the migration instead, run
   `docker compose up -d --pull never --wait` in `NEW_DIR`. Its `.env` still
   pins the old images. Then run `server/install-timer.sh` with the arguments

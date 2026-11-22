@@ -207,6 +207,12 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
+@test "db_fingerprint_sql covers index type and order" {
+  run db_fingerprint_sql matomo_ true
+  [[ "$output" == *"index_type"* ]]
+  [[ "$output" == *"collation"* ]]
+}
+
 @test "db_fingerprint_sql escapes the prefix and includes versions only when installed" {
   run db_fingerprint_sql matomo_ true
   [ "$status" -eq 0 ]
@@ -262,9 +268,21 @@ setup() {
 @test "conflicting_shared_images reports a reference shared by different image IDs" {
   run conflicting_shared_images <<<"$(printf '%s\n' 'matomo crazymax/matomo:latest sha256:a' \
     'cron crazymax/matomo:latest sha256:b' 'db mariadb:10.4 sha256:c' 'redis redis:4 sha256:c')"
-  [ "$output" = crazymax/matomo:latest ]
+  [ "$output" = docker.io/crazymax/matomo:latest ]
   run conflicting_shared_images <<<"$(printf '%s\n' 'matomo m:1 sha256:a' 'cron m:1 sha256:a')"
   [ -z "$output" ]
+}
+
+@test "normalize_reference makes Docker reference aliases equal" {
+  [ "$(normalize_reference crazymax/matomo)" = docker.io/crazymax/matomo:latest ]
+  [ "$(normalize_reference docker.io/crazymax/matomo:latest)" = docker.io/crazymax/matomo:latest ]
+  [ "$(normalize_reference redis:4)" = docker.io/library/redis:4 ]
+  [ "$(normalize_reference ghcr.io/x/matomo)" = ghcr.io/x/matomo:latest ]
+  [ "$(normalize_reference localhost:5000/m:1)" = localhost:5000/m:1 ]
+  [ "$(normalize_reference mariadb@sha256:ab)" = docker.io/library/mariadb@sha256:ab ]
+  run conflicting_shared_images <<<"$(printf '%s\n' 'matomo crazymax/matomo sha256:old' \
+    'cron docker.io/crazymax/matomo:latest sha256:new')"
+  [ "$output" = docker.io/crazymax/matomo:latest ]
 }
 
 @test "is_missing_tag_error separates a missing tag from network errors" {
@@ -315,4 +333,10 @@ setup() {
   run finalize_env
   [ "$status" -eq 3 ]
   [ "$(cat "$NEW_DIR/.env")" = "$before" ]
+  # the temporary copy with the password is gone
+  [ -z "$(find "$NEW_DIR" -name '.env.final.*')" ]
+  # a failing logger does not change the exit code
+  log() { return 1; }
+  run finalize_env
+  [ "$status" -eq 3 ]
 }
