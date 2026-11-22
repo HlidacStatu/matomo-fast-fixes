@@ -14,7 +14,13 @@ if [ -f "/data/config/config.ini.php" ] && grep -q '^\[database\]' "/data/config
   console config:set --section=log --key=log_level --value="$LOG_LEVEL"
 
   echo "Upgrading and setting Matomo configuration..."
-  console core:update --yes --no-interaction
+  # Deviation from upstream: a failed database upgrade stops the container
+  # (S6_BEHAVIOUR_IF_STAGE2_FAILS=2) instead of starting Matomo on a
+  # half-migrated schema, so `docker compose up --wait` reports the failure.
+  if ! console core:update --yes --no-interaction; then
+    echo "ERROR: core:update failed" >&2
+    exit 1
+  fi
   console config:set --section=General --key=minimum_memory_limit --value=-1
 else
   echo ">>"

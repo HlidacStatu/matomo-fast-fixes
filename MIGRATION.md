@@ -4,7 +4,8 @@ This guide moves an existing stack built from the crazymax example
 `docker-compose.yml` (services `db`, `redis`, `msmtpd`, `geoip-updater`,
 `matomo`, `cron`, bind mounts under `/data/matomo`) to this repository's
 `server/compose.yml`. Data is not lost, and Matomo is unavailable only while
-the containers are recreated, usually under a minute.
+the containers are recreated and Matomo starts: under a minute when the
+Matomo version stays the same, longer if database migrations have to run.
 
 Why no data is lost:
 
@@ -52,39 +53,94 @@ Arguments:
 - `NEW_DIR` (`/opt/matomo-hs`) is an empty or missing directory for the new
   `compose.yml` and `.env`.
 
+### Principle: the migration changes orchestration, not versions
+
+The switch runs exactly the software the old stack runs:
+- MariaDB, Redis, msmtpd and geoip-updater on the old images, pinned by
+  digest,
+- Matomo on this repository's image of the *same* Matomo version (for
+  example `ghcr.io/hlidacstatu/matomo:5.14.1`).
+
+The database is therefore not migrated, and a failed switch can return to
+the old stack without restoring anything. Tracking data written in the
+meantime is kept.
+
+When the switch succeeds, the script points `.env` at the tracked lines
+(`ghcr.io/hlidacstatu/matomo:5`, `mariadb:<running major.minor>`,
+`redis:8-alpine`, ...). The next `matomo-update.sh` run (systemd timer)
+upgrades to them with its own backup, verification and rollback.
+
+If the registry has no image of the running Matomo version, the switch uses
+the tracked image and therefore also upgrades Matomo. The plan prints a
+warning in that case.
+
 ### What the script does
 
 1. **Checks** the following and stops with a clear message if something does
    not hold:
    - Docker Engine 25 or newer,
    - all six services are running,
-   - every data directory is a bind mount,
+   - only the default network is used, no extra labels, no `container_name`,
+     no command or entrypoint overrides (the `db` command must equal the one
+     in `compose.yml`),
+   - data is only in bind mounts, and redis/msmtpd have no volumes,
+   - the published port matches the running container,
    - `config.ini.php` uses the `db` service's credentials (pre-flight check
      below),
+   - QueuedTracking is not active,
    - the Matomo major version matches.
 2. **Generates `NEW_DIR`** from the *running* containers. It reads their
    environment (minus image defaults), bind mounts and published port, so
    values from `environment:`, `env_file:` and shell variables are all carried
    over exactly.
-   - MariaDB stays on the release line it runs now (e.g. `mariadb:10.11`), so
-     the data directory is not upgraded by the migration.
-   - The project name stays the same.
-3. **Pulls the new images** and shows the plan.
-4. **Asks for confirmation.** Use `--yes` for non-interactive runs.
-5. **Takes a backup.** It stops cron, then dumps the database (the check
-   requires `-- Dump completed` and at least one table) and archives `config/`
-   into `<web dir>/../backups`.
-6. **Switches over (the downtime).** It moves every file of `OLD_DIR` except
-   data directories into `OLD_DIR/_old_` and runs
-   `docker compose up -d --wait` in `NEW_DIR`, which recreates the containers
-   in place.
-7. **Verifies the new stack:** HTTP, Matomo version and `core:update`.
-8. **Installs the update timer** (`server/install-timer.sh`) and prints where
-   everything is.
+   - `COMPOSE_*` variables and `.env` keys exported in your shell are ignored.
+   - The resolved compose model is checked against the plan.
+3. **Pulls the Matomo image for the switch** and shows the plan. Tracked
+   images are only looked up, not pulled, so tags used by the old compose
+   file do not move.
+4. **Asks for confirmation.** Use `--yes` for non-interactive runs. If you
+   decline, or anything fails before the switch, `NEW_DIR` is removed again.
+5. **Takes a backup.** It stops cron, checks free space (at least the size of
+   the database), dumps the database and archives `config/` into
+   `<web dir>/../backups`.
+   - The dump check requires `-- Dump completed` and at least one table.
+   - Files are created with mode 600, the directory with 700.
+   - A schema fingerprint is recorded as well (see `server/lib/db.sh`).
+6. **Switches over (the downtime starts).** It moves every file of `OLD_DIR`
+   except data directories into `OLD_DIR/_old_` and runs
+   `docker compose up --pull never --wait` in `NEW_DIR` for every service
+   except cron. This recreates the containers in place.
+7. **Verifies the new stack:** HTTP on `/matomo.php`, the Matomo version and
+   `core:update`. Then it starts cron, and the downtime ends.
+8. **Updates `.env` and installs the timer.** It points `.env` at the tracked
+   image lines and installs the update timer (`server/install-timer.sh`).
+   The timer setup refuses an existing config that points to another stack.
+   Finally it prints where everything is.
 
-**If step 6 or 7 fails, it rolls back automatically.** The new containers are
-removed and the files are moved back from `_old_`. The database and `config/`
-are restored from the backup, and the old stack is started again. Exit codes:
+**If step 6 or 7 fails, or the script is interrupted (Ctrl+C, SIGTERM, an
+unexpected error), it rolls back automatically.**
+
+1. It removes the new containers and verifies that none is left.
+2. It moves the files back from `_old_` and re-tags the old images.
+3. It starts the old database and compares its schema fingerprint with the
+   one taken before the switch. **Only if the schema changed**, which means
+   Matomo ran migrations, it restores the dump, discarding data tracked since
+   the backup. Otherwise all data is kept.
+4. It replaces `config/` with the archived copy, starts the old stack with
+   `--pull never` and checks it over HTTP.
+
+**Downtime** lasts from step 6 to the end of step 7: recreating the containers
+plus Matomo's start. With the same Matomo version this is typically under a
+minute (31 s in the CI test). If the switch also upgrades Matomo, it includes
+the database migrations, which can take much longer on a large database.
+
+**Power loss during steps 6–7** is not recovered automatically. In that case:
+- `OLD_DIR/_old_` and `NEW_DIR/migration.log` show how far the migration got.
+- To go back, move the files from `_old_` to `OLD_DIR`, then run
+  `docker compose up -d` there.
+- To finish the migration instead, run `docker compose up -d` in `NEW_DIR`.
+
+Exit codes:
 
 | Code | Meaning |
 |---|---|
@@ -96,9 +152,11 @@ are restored from the backup, and the old stack is started again. Exit codes:
 Options:
 - `--start-period DURATION` sets `MATOMO_START_PERIOD`, the grace period for
   DB migrations. Raise it for very large databases.
-- `--wait-timeout SECONDS` sets how long the switch may wait for a healthy
-  stack.
-- `--matomo-image IMAGE` pins a specific image.
+- `--wait-timeout SECONDS` sets how long the switch, and later
+  `matomo-update.sh`, may wait for a healthy stack. It must be longer than
+  the start period.
+- `--matomo-image IMAGE` sets the Matomo image the stack tracks after the
+  migration.
 
 Still check the database credentials (step 0) before the first run. The script
 refuses to continue on a mismatch, but fixing it is up to you. Afterwards do
@@ -291,13 +349,13 @@ Then check in the Matomo UI:
 ## 7. Enable automatic updates
 
 ```sh
-/opt/matomo-fast-fixes/server/install-timer.sh /opt/matomo /data/matomo/backups http://127.0.0.1:8000/
+/opt/matomo-fast-fixes/server/install-timer.sh /opt/matomo /data/matomo/backups http://127.0.0.1:8000/matomo.php 2400
 systemctl start matomo-update.service      # first run by hand
 journalctl -u matomo-update -n 20          # expect event "no_update"
 ```
 
-`install-timer.sh` creates `/etc/matomo-update/matomo-update.env` (an existing
-one is kept), installs the systemd units with the real script path and enables
+`install-timer.sh` creates `/etc/matomo-update/matomo-update.env`. It keeps an
+existing file only if that file already points to the same `COMPOSE_DIR`, installs the systemd units with the real script path and enables
 the timer.
 
 ## 8. Follow-up hardening (separate maintenance windows)

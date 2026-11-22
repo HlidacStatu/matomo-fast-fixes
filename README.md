@@ -84,17 +84,21 @@ needed on the servers.
    `server/migrate-from-crazymax.sh OLD_DIR NEW_DIR` instead. It generates
    this configuration from the running containers, keeps the data in place,
    moves the old files to `OLD_DIR/_old_`, rolls back automatically on
-   failure and installs the timer from step 3. Downtime is about a minute.
+   failure and installs the timer from step 3. The switch keeps all software
+   versions (database untouched); the timer upgrades afterwards. Downtime is
+   typically under a minute.
    Details and the manual procedure are in [MIGRATION.md](MIGRATION.md).
 
 3. **Update script.**
 
    ```sh
-   /opt/matomo-fast-fixes/server/install-timer.sh /opt/matomo /data/matomo/backups http://127.0.0.1:8000/
+   /opt/matomo-fast-fixes/server/install-timer.sh /opt/matomo /data/matomo/backups http://127.0.0.1:8000/matomo.php 2400
    ```
 
-   This creates `/etc/matomo-update/matomo-update.env` from the example (an
-   existing file is kept; adjust the remaining values there), installs the
+   Arguments: `COMPOSE_DIR BACKUP_DIR HEALTH_URL WAIT_TIMEOUT_SECONDS`. This
+   creates `/etc/matomo-update/matomo-update.env` from the example (an
+   existing file is kept only if it points to the same `COMPOSE_DIR`; adjust
+   the remaining values there), installs the
    systemd units with the real path of this checkout and enables the timer.
 
    First run by hand: `systemctl start matomo-update.service && journalctl -u matomo-update -n 50`.
@@ -107,15 +111,20 @@ needed on the servers.
 |---|---|---|
 | no new image | nothing happens (no restart, no backup) | 0 |
 | new image, verification passes | deployed, old backups/images pruned | 0 |
-| new image, verification fails | rolled back, DB + config restored, image ID blocked | 1 |
+| new image, verification fails or run interrupted | rolled back to the previous images, config restored, DB restored only if its schema changed, image ID blocked | 1 |
 | rollback fails | log event `rollback_failed`, backups kept for manual restore | 1 |
 | invalid config / missing tools | nothing happens | 2 |
 
 Logs are JSON lines in journald and in `LOG_FILE`, e.g.
 `jq 'select(.level != "info")' /var/log/matomo-update/matomo-update.log`.
 
-A rollback discards tracking data written between the backup and the rollback
-(typically a few minutes). Blocked images are listed in
+A rollback restores the database dump only when the failed update changed
+the schema (Matomo migrations ran; see `server/lib/db.sh`). Only then is the
+tracking data written between the backup and the rollback (typically a few
+minutes) discarded. Before a dump the script checks that the backup
+filesystem has at least as much free space as the database. Containers are
+always started with `up --pull never`, so a rollback is not undone by a pull
+of a `latest` tag. Blocked images are listed in
 `$STATE_DIR/blocked-images`; delete a line to allow a retry of that image.
 
 **Manual rollback** to a specific build: set `MATOMO_IMAGE` in `.env` to an

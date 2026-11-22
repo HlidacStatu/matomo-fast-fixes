@@ -4,13 +4,17 @@
 #
 # Starts the old crazymax stack (test/migration/docker-compose.crazymax.yml),
 # creates a marker table and then:
-#   1. --dry-run              must change nothing,
+#   1. --dry-run must change nothing; a migration that cannot be confirmed
+#      must leave no NEW_DIR behind,
 #   2. migration to a broken image (healthcheck fails and drops the marker
-#      table) must roll back: old files back, old images running, marker
-#      table restored from the backup, no timer installed,
-#   3. migration to the candidate image must succeed: old files in _old_,
-#      data untouched, environment carried over, timer installed and a
-#      first matomo-update run reports nothing to do.
+#      table) must roll back: old files back, the exact old images running
+#      for all six services, marker table restored from the backup (schema
+#      changed), no timer installed,
+#   3. migration to the candidate image must succeed even with conflicting
+#      COMPOSE_*/.env variables exported: old files in _old_, data untouched,
+#      old images kept for the switch, environment carried over, private
+#      backups, .env pointed at the tracked image lines, timer installed and
+#      its first run deploys them.
 #
 # Usage: test/migration/run.sh CANDIDATE_IMAGE
 set -euo pipefail
@@ -82,6 +86,14 @@ marker_value() {
     'MYSQL_PWD="$MYSQL_PASSWORD" mariadb -N -u"$MYSQL_USER" "$MYSQL_DATABASE" -e "SELECT v FROM it_marker"') 2>/dev/null || true
 }
 
+# Image IDs of all services of the stack in DIR, one "service id" per line.
+stack_images() {
+  local dir=$1 svc
+  for svc in db redis msmtpd geoip-updater matomo cron; do
+    printf '%s %s\n' "$svc" "$(running_image "$dir" "$svc")"
+  done
+}
+
 container_env_value() {
   local dir=$1 svc=$2 key=$3
   (cd "$dir" && docker compose exec -T "$svc" printenv "$key")
@@ -110,6 +122,7 @@ cp "$TEST_DIR/matomo.env" "$TEST_DIR/msmtpd.env" "$TEST_DIR/geoip-updater.env" "
 echo "notes kept next to the old compose file" >"$OLD/notes.txt"
 old_compose up -d --wait --wait-timeout "$IT_WAIT_TIMEOUT_SECONDS"
 old_image=$(running_image "$OLD" matomo)
+old_images=$(stack_images "$OLD")
 deadline=$((SECONDS + IT_WAIT_TIMEOUT_SECONDS))
 # shellcheck disable=SC2016
 until old_compose exec -T db sh -c 'MYSQL_PWD="$MYSQL_PASSWORD" mariadb -u"$MYSQL_USER" "$MYSQL_DATABASE" -e "CREATE TABLE it_marker (v INT); INSERT INTO it_marker VALUES (42);"' 2>/dev/null; do
@@ -125,18 +138,30 @@ status=0
 [[ -f $OLD/docker-compose.yml && ! -e $OLD/_old_ ]] || fail "dry run touched OLD_DIR"
 [[ $(running_image "$OLD" matomo) == "$old_image" ]] || fail "dry run changed the running stack"
 
+echo "--- case 1b: an unconfirmed migration leaves nothing behind"
+status=0
+"$MIGRATE" --matomo-image "$IMAGE:5" "$OLD" "$WORK/new-unconfirmed" </dev/null >&2 || status=$?
+[[ $status == 1 ]] || fail "unconfirmed migration exited with $status"
+[[ ! -e $WORK/new-unconfirmed ]] || fail "unconfirmed migration left NEW_DIR behind"
+[[ $(stack_images "$OLD") == "$old_images" ]] || fail "unconfirmed migration changed the running stack"
+
 echo "--- case 2: failed migration is rolled back"
 status=$(migrate --matomo-image "$IMAGE:broken" "$OLD" "$WORK/new-broken")
 [[ $status == 1 ]] || fail "expected exit 1, got $status"
 grep -q '"event":"rollback_succeeded"' "$WORK/new-broken/migration.log" || fail "no rollback_succeeded event"
 [[ -f $OLD/docker-compose.yml && -f $OLD/notes.txt && ! -e $OLD/_old_ ]] || fail "old files were not moved back"
-[[ $(running_image "$OLD" matomo) == "$old_image" ]] || fail "old matomo image is not running"
+[[ $(stack_images "$OLD") == "$old_images" ]] || fail "rollback did not restore the exact old images"
+grep -q '"event":"db_restore"' "$WORK/new-broken/migration.log" || fail "changed schema was not restored"
 [[ $(marker_value "$OLD") == 42 ]] || fail "marker table was not restored"
 [[ ! -f /etc/systemd/system/matomo-update.timer ]] || fail "timer installed after a failed migration"
 
 echo "--- case 3: successful migration"
 NEW="$WORK/new"
-status=$(migrate --matomo-image "$IMAGE:5" "$OLD" "$NEW")
+# Conflicting variables in the operator's shell must not leak into compose.
+status=0
+env COMPOSE_PROJECT_NAME=bogus COMPOSE_FILE=/nonexistent.yml MATOMO_DB_DIR=/nonexistent MARIADB_IMAGE=bogus:1 \
+  "$MIGRATE" --yes --start-period "$IT_START_PERIOD" --wait-timeout "$IT_WAIT_TIMEOUT_SECONDS" \
+  --matomo-image "$IMAGE:5" "$OLD" "$NEW" >&2 || status=$?
 [[ $status == 0 ]] || fail "expected exit 0, got $status"
 for file in docker-compose.yml matomo.env msmtpd.env geoip-updater.env notes.txt; do
   [[ -e $OLD/_old_/$file ]] || fail "$file was not moved to _old_"
@@ -146,7 +171,14 @@ done
 [[ $(running_image "$NEW" matomo) == "$(image_id "$IMAGE:5")" ]] || fail "new matomo image is not running"
 [[ $(running_image "$NEW" cron) == "$(image_id "$IMAGE:5")" ]] || fail "new cron image is not running"
 [[ $(marker_value "$NEW") == 42 ]] || fail "marker table lost"
-grep -Eq "^MARIADB_IMAGE='mariadb:[0-9]+\.[0-9]+'$" "$NEW/.env" || fail "MariaDB line not pinned"
+[[ $(running_image "$NEW" db) == $(awk '$1 == "db" { print $2 }' <<<"$old_images") ]] || fail "db image changed during the switch"
+[[ $(running_image "$NEW" redis) == $(awk '$1 == "redis" { print $2 }' <<<"$old_images") ]] || fail "redis image changed during the switch"
+grep -Eq "^MARIADB_IMAGE='mariadb:[0-9]+\.[0-9]+'$" "$NEW/.env" || fail ".env does not track the MariaDB release line"
+grep -qx "REDIS_IMAGE='redis:8-alpine'" "$NEW/.env" || fail ".env does not track the Redis line"
+for file in "$DATA"/backups/*; do
+  [[ $(stat -c %a "$file") == 600 ]] || fail "backup $file is not private"
+done
+[[ $(stat -c %a "$DATA/backups") == 700 ]] || fail "backup directory is not private"
 # shellcheck disable=SC2016
 [[ $(container_env_value "$NEW" msmtpd SMTP_PASSWORD) == 'bar$baz' ]] || fail "msmtpd password not carried over literally"
 [[ $(container_env_value "$NEW" matomo MEMORY_LIMIT) == 256M ]] || fail "matomo.env not carried over"
@@ -158,6 +190,8 @@ systemctl is-enabled --quiet matomo-update.timer || fail "timer is not enabled"
 grep -qx "COMPOSE_DIR=$NEW" "$UPDATE_CONFIG" || fail "update config does not point to NEW_DIR"
 systemctl start matomo-update.service
 [[ $(systemctl show -p Result --value matomo-update.service) == success ]] || fail "first update run failed"
-[[ $(tail -n1 "$UPDATE_LOG" | jq -r .event) == no_update ]] || fail "first update run did not report no_update"
+last=$(tail -n1 "$UPDATE_LOG" | jq -r .event)
+[[ $last == update_succeeded ]] || fail "first update run did not deploy the tracked images (last event: $last)"
+[[ $(running_image "$NEW" redis) == $(image_id redis:8-alpine) ]] || fail "tracked Redis image not deployed"
 
 echo "migration test passed"

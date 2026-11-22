@@ -25,6 +25,8 @@ docker compose exec -T cron sh -s <services.sh
 
 echo "--- HTTP"
 curl -fsS -o /dev/null -w '%{http_code}\n' --retry 10 --retry-all-errors --retry-delay 2 http://127.0.0.1:8000/
+# Tracker endpoint, the default HEALTH_URL of matomo-update.sh.
+curl -fsS -o /dev/null -w '%{http_code}\n' --retry 10 --retry-all-errors --retry-delay 2 http://127.0.0.1:8000/matomo.php
 
 echo "--- Matomo version"
 # shellcheck disable=SC2016

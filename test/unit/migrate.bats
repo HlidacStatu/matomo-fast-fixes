@@ -172,3 +172,49 @@ setup() {
   run parse_args --unknown /a /b
   [ "$status" -ne 0 ]
 }
+
+@test "duration_to_seconds understands s, m and h" {
+  [ "$(duration_to_seconds 1800s)" = 1800 ]
+  [ "$(duration_to_seconds 30m)" = 1800 ]
+  [ "$(duration_to_seconds 2h)" = 7200 ]
+  run duration_to_seconds 10
+  [ "$status" -ne 0 ]
+}
+
+@test "image_repository strips tags and digests but keeps registry ports" {
+  [ "$(image_repository ghcr.io/hlidacstatu/matomo:5)" = ghcr.io/hlidacstatu/matomo ]
+  [ "$(image_repository localhost:5000/matomo:broken)" = localhost:5000/matomo ]
+  [ "$(image_repository localhost:5000/matomo)" = localhost:5000/matomo ]
+  [ "$(image_repository mariadb@sha256:abc)" = mariadb ]
+  [ "$(image_repository redis:4.0-alpine)" = redis ]
+}
+
+@test "set_env_file_value replaces only the given key" {
+  file="$BATS_TEST_TMPDIR/.env"
+  printf "%s\n" "MARIADB_IMAGE='mariadb@sha256:abc'" "MARIADB_IMAGE_OTHER='x'" "TZ='UTC'" >"$file"
+  set_env_file_value "$file" MARIADB_IMAGE mariadb:10.11
+  [ "$(cat "$file")" = "$(printf "%s\n" "MARIADB_IMAGE='mariadb:10.11'" "MARIADB_IMAGE_OTHER='x'" "TZ='UTC'")" ]
+  run set_env_file_value "$file" TZ "it's"
+  [ "$status" -ne 0 ]
+}
+
+@test "ini_has_plugin finds activated plugins only" {
+  ini="$BATS_TEST_TMPDIR/config.ini.php"
+  printf '%s\n' '[Plugins]' 'Plugins[] = "CoreHome"' 'Plugins[] = "QueuedTracking"' \
+    '[PluginsInstalled]' 'PluginsInstalled[] = "CustomAlerts"' >"$ini"
+  ini_has_plugin "$ini" QueuedTracking
+  run ini_has_plugin "$ini" CustomAlerts
+  [ "$status" -ne 0 ]
+}
+
+@test "db_fingerprint_sql escapes the prefix and includes versions only when installed" {
+  run db_fingerprint_sql matomo_ true
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"NOT LIKE 'matomo\_archive\_%'"* ]]
+  [[ "$output" == *'`matomo_option`'* ]]
+  [[ "$output" == *"LIKE 'version\_%'"* ]]
+  run db_fingerprint_sql matomo_ false
+  [[ "$output" != *option* ]]
+  run db_fingerprint_sql "x'; DROP" true
+  [ "$status" -ne 0 ]
+}

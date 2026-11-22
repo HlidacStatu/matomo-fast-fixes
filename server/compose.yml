@@ -5,8 +5,10 @@
 # Every service has a healthcheck, so `docker compose up --wait` (used by
 # matomo-update.sh) only returns once the stack really works.
 #
-# Do not set `pull_policy` here: matomo-update.sh relies on `up` using the
-# locally tagged image so that it can roll back by re-tagging.
+# Images are pulled only by `docker compose pull` (matomo-update.sh); the
+# scripts start containers with `up --pull never`, so a rollback that re-tags
+# the previous image locally is not undone by a pull (with the default
+# pull_policy `missing`, Compose still pulls `latest` tags on every `up`).
 
 services:
   db:
